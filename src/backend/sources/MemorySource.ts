@@ -137,25 +137,27 @@ export default class MemorySource extends AbstractSource {
         // if we haven't already tried to discover any in-progress plays then do it now (and only once)
         if(!this.playerCleanupDiscoveryAttempt.has(key)) {
             this.playerCleanupDiscoveryAttempt.set(key, true);
-            // get play as completed
-            const cleanupPlay = player.getPlayedObject(true);
-            let discoverablePlay: boolean;
-            if(cleanupPlay !== undefined) {
-                const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(cleanupPlay);
-                discoverablePlay = discoverable;
-                if(this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
-                    player.logger.verbose({labels: label}, discoverableReason);
-                }
-                if(discoverable) {
-                    discoveredCleanupPlay = cleanupPlay;
-                    // we are discovering/scrobbling play 
-                    // and since player is now stale we should treat this "session" as ended
-                    // -- so if user resumes a stale play later its a new session (new real time period of them listening)
-                    // basically this is the same as if the player was orphaned and removed
-                    // 
-                    // so we remove listen ranges so the old accumulated listen time can't be used for the "new" listening session
-                    player.listenRanges = [];
-                    player.currentListenRange = undefined;
+            // get play as completed if not already scrobbled
+            if(!player.hasScrobbled) {
+                const cleanupPlay = player.getPlayedObject(true);
+                let discoverablePlay: boolean;
+                if(cleanupPlay !== undefined) {
+                    const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(cleanupPlay);
+                    discoverablePlay = discoverable;
+                    if(this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
+                        player.logger.verbose({labels: label}, discoverableReason);
+                    }
+                    if(discoverable) {
+                        discoveredCleanupPlay = cleanupPlay;
+                        // we are discovering/scrobbling play 
+                        // and since player is now stale we should treat this "session" as ended
+                        // -- so if user resumes a stale play later its a new session (new real time period of them listening)
+                        // basically this is the same as if the player was orphaned and removed
+                        // 
+                        // so we remove listen ranges so the old accumulated listen time can't be used for the "new" listening session
+                        player.listenRanges = [];
+                        player.currentListenRange = undefined;
+                    }
                 }
             }
         }
@@ -190,6 +192,7 @@ export default class MemorySource extends AbstractSource {
     setNewPlayer = (idStr: string, logger: Logger, id: PlayPlatformId, opts: PlayerStateOptions = {}): AbstractPlayerState => {
         const player = this.getNewPlayer(this.logger, id, {
             ...createPlayerOptions(this.config.data as Partial<PollingOptions>, this.playerSourceOfTruth, this.logger),
+            thresholds: this.config.options?.scrobbleThresholds,
             ...opts
         });
         this.players.set(idStr, player);
@@ -372,26 +375,15 @@ export default class MemorySource extends AbstractSource {
             if (matchingRecent.match === false) {
                 return [true,`${stPrefix} added after ${thresholdResultSummary(thresholdResults)} and not matching any prior plays`];
             } else {
-                const {data: {playDate, duration}} = candidate;
+                const {data: {playDate}} = candidate;
                 // existingPlay always sets closestMatchedPlay when match is true
                 const rplayDate = matchingRecent.closestMatchedPlay?.data.playDate;
                 if (playDate === undefined || rplayDate === undefined) {
                     return [false, `${stPrefix} matched a prior play but could not compare timestamps because a play date is missing`];
                 }
-                if (!playDate.isSame(rplayDate)) {
-                    if (duration !== undefined) {
-                        if (playDate.isAfter(rplayDate.add(duration, 's'))) {
-                            return [true,`${stPrefix} added after ${thresholdResultSummary(thresholdResults)} and having a different timestamp than a prior play`];
-                        }
-                        return [false, `${stPrefix} ${EXPECTED_NON_DISCOVERED_REASON}`]
-                    } else {
-                        const discoveredPlays = await this.getRecentlyDiscoveredPlays();
-                        if (discoveredPlays.length === 0 || !playObjDataMatch(discoveredPlays[0], candidate)) {
-                            // if most recent stateful play is not this track we'll add it
-                            return [true,`${stPrefix} added after ${thresholdResultSummary(thresholdResults)}. Matched other recent play but could not determine time frame due to missing duration. Allowed due to not being last played track.`];
-                        }
-                        return [false, `${stPrefix} not added because it matched the last discovered play and could not determine time frame of play`];
-                    }
+                const diff = Math.abs(playDate.diff(rplayDate, 'seconds'));
+                if (diff > 30) {
+                    return [true, `${stPrefix} added after ${thresholdResultSummary(thresholdResults)} and having a different timestamp than a prior play (>30s)`];
                 } else {
                     return [false, `${stPrefix} ${EXPECTED_NON_DISCOVERED_REASON}`];
                 }

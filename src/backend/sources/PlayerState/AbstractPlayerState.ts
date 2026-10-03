@@ -19,7 +19,8 @@ import { formatNumber } from '../../../core/DataUtils.ts';
 import type {ListenProgress} from "./ListenProgress.ts";
 import type { ListenRange} from "./ListenRange.ts";
 import { ListenRangePositional } from "./ListenRange.ts";
-import { closeToPlayEnd, closeToPlayStart, repeatDurationPlayed } from "../../utils/TimeUtils.ts";
+import { timePassesScrobbleThreshold } from "../../utils/TimeUtils.ts";
+import type { ScrobbleThresholds } from "../../common/infrastructure/config/source/index.ts";
 import { timeToHumanTimestamp } from "../../../core/TimeUtils.ts";
 import { todayAwareFormat } from "../../../core/TimeUtils.ts";
 
@@ -31,6 +32,7 @@ export interface PlayerStateIntervals {
 export interface PlayerStateOptions extends PlayerStateIntervals {
     allowedDrift?: number
     rtTruth?: boolean
+    thresholds?: ScrobbleThresholds
 }
 
 export const DefaultPlayerStateOptions: PlayerStateOptions = {};
@@ -88,6 +90,8 @@ export abstract class AbstractPlayerState {
 
     lastPlay?: PlayObject
     lastPlayUpdatedAt?: Dayjs
+    public hasScrobbled: boolean = false;
+    protected thresholds: ScrobbleThresholds = {};
 
     protected constructor(logger: Logger, platformId: PlayPlatformId, opts: PlayerStateOptions = DefaultPlayerStateOptions) {
         this.platformId = platformId;
@@ -96,8 +100,10 @@ export abstract class AbstractPlayerState {
         const {
             staleInterval = 120,
             orphanedInterval = 300,
+            thresholds = {}
         } = opts;
         this.stateIntervalOptions = {staleInterval, orphanedInterval: orphanedInterval};
+        this.thresholds = thresholds;
     }
 
     [Symbol.dispose]() {
@@ -187,8 +193,9 @@ export abstract class AbstractPlayerState {
             if (status === 'stopped' && this.reportedStatus !== 'stopped' && this.currentPlay !== undefined) {
                 this.stopPlayer();
                 const play = this.getPlayedObject(true);
+                const emitPlay = !this.hasScrobbled ? play : undefined;
                 this.clearPlayer();
-                return [play, play];
+                return [play, emitPlay];
             }
             this.reportedStatus = status;
         } else if (this.reportedStatus === undefined) {
@@ -207,9 +214,10 @@ export abstract class AbstractPlayerState {
 
         if (this.currentPlay !== undefined) {
             if (!this.incomingPlayMatchesExisting(play)) { // TODO check new play date and listen range to see if they intersect
-                this.logger.debug(`Incoming play state (${buildTrackString(play, {include: ['trackId', 'artist', 'track']})}) does not match existing state, removing existing: ${buildTrackString(this.currentPlay, {include: ['trackId', 'artist', 'track']})}`)
+                this.logger.debug(`Incoming play state (${buildTrackString(play, {include: ['trackId', 'artist', 'track']})}) does not match existing state, removing existing: ${buildTrackString(this.currentPlay, {include: ['trackId', 'artist', 'track']})}`);
                 this.currentListenSessionEnd();
                 const played = this.getPlayedObject(true);
+                const emitPlay = !this.hasScrobbled ? played : undefined;
                 this.isRepeatPlay = false;
                 this.lastPlay = played;
                 this.lastPlayUpdatedAt = playUpdatedAt ?? dayjs();
@@ -217,25 +225,20 @@ export abstract class AbstractPlayerState {
                 if (this.calculatedStatus !== CALCULATED_PLAYER_STATUSES.playing) {
                     this.calculatedStatus = CALCULATED_PLAYER_STATUSES.unknown;
                 }
-                return [this.requirePlayedObject(), played];
+                return [this.requirePlayedObject(), emitPlay];
             } else if (status !== undefined && !AbstractPlayerState.isProgressStatus(status)) {
                 this.currentListenSessionEnd();
                 this.calculatedStatus = this.reportedStatus;
-            } else if (this.isSessionRepeat(state.position, reportedTS)) {
-                // if we detect the track has been restarted end listen session and treat as a new play
-                const sessionless = this.currentListenRange === undefined;
+            } else if (this.isPositionRewind(state.position)) {
+                this.logger.debug('New Play is a repeat (rewind detected)');
                 this.currentListenSessionEnd();
-                const played = this.getPlayedObject(true);
-                play.data.playDate = dayjs();
+                this.hasScrobbled = false;
+                this.playFirstSeenAt = reportedTS ?? dayjs();
+                this.listenRanges = [];
+                this.currentListenRange = undefined;
                 this.isRepeatPlay = true;
-                if(sessionless) {
-                    // if repeat occurred due to previous closed session
-                    // then we need to force a new session or else we'll miss a listening interval
-                    this.currentListenSessionContinue(state.position, reportedTS);
-                }
-                this.logger.debug('New Play is a repeat');
-                this.setCurrentPlay(state, {reportedTS});
-                return [this.requirePlayedObject(), played];
+                this.currentListenSessionContinue(state.position, reportedTS);
+                return [this.requirePlayedObject(), undefined];
             } else {
                 if(this.currentListenRange !== undefined) {
                     const [isSeeked, seekedPos] = this.currentListenRange.seeked(state.position, reportedTS);
@@ -250,6 +253,12 @@ export abstract class AbstractPlayerState {
                 }
 
                 this.currentListenSessionContinue(state.position, reportedTS);
+
+                if (!this.hasScrobbled && timePassesScrobbleThreshold(this.thresholds, this.getListenDuration(), this.currentPlay.data.duration).passes) {
+                    this.hasScrobbled = true;
+                    const scrobblePlay = this.getPlayedObject(false);
+                    return [this.requirePlayedObject(), scrobblePlay];
+                }
             }
         } else {
             this.isRepeatPlay = false;
@@ -285,6 +294,7 @@ export abstract class AbstractPlayerState {
         this.listenRanges = [];
         this.currentListenRange = undefined;
         this.isRepeatPlay = false;
+        this.hasScrobbled = false;
     }
 
     protected stopPlayer() {
@@ -352,80 +362,23 @@ export abstract class AbstractPlayerState {
 
     protected abstract currentListenSessionEnd(): void;
 
-    /** Check if new Player Position was seeked to a Position that indicates user is repeating the track
-     * 
-     * True if:
-     *   * New position was/is seeked and is now close to start of Play and...
-     *     * Listened duraton is more than 2 minutes/50% of Play OR...
-     *     * Previous Position was close to end of Play
-     */
-    protected isSessionRepeat(position?: number, reportedTS?: Dayjs): boolean {
-        const currentPlay = this.currentPlay;
-        // can't be close to start without a position
-        if(currentPlay === undefined || position === undefined) {
+    /** Check if incoming position for the same track dropped backwards by at least 50% or 4 minutes after track already scrobbled */
+    public isPositionRewind(newPosition?: number): boolean {
+        if (this.currentPlay === undefined || newPosition === undefined || !this.hasScrobbled) {
             return false;
         }
-        if(this.currentListenRange !== undefined) {
-            const [isSeeked, seekPos] = this.currentListenRange.seeked(position, reportedTS);
-            if (isSeeked === false || seekPos > 0) {
-                return false;
-            }
+        const lastPos = this.getPosition();
+        if (lastPos === undefined) {
+            return false;
         }
-
-        const hints: string[] = [];
-
-        const repeatHint = `New Position (${position})`;
-        const trackDur = currentPlay.data.duration;
-
-        // new position is close to start of Play
-        const [closeStart, closeStartHint] = closeToPlayStart(currentPlay, position, {hintPrefix: false});
-        hints.push(closeStartHint);
-
-        if (closeStart) {
-            const playerDur = this.getListenDuration();
-            const [repeatDurationOk, repeatDurationHint] = repeatDurationPlayed(currentPlay, playerDur, {hintPrefix: false});
-
-            // user has played at least 2 minutes or 50% of track
-            // and the current (new) listen range was close to the start
-            // and current range was seeked
-            if (this.currentListenRange !== undefined && repeatDurationOk) {
-                this.logger.verbose(`${repeatHint} ${[closeStartHint, repeatDurationHint].join(' and ')}`);
-                return true;
-            }
-
-            // if duration was not satisfied *or* we don't have a current listen range
-            // then we check last position with proximity to end of the track
-            const lastPosCandidate: {pos: number, context: string}[] = [];
-            const lastPos = this.currentListenRange?.getPosition();
-            if(lastPos !== undefined) {
-                // current listen range was seeked, but not closed (yet), check last end position
-                lastPosCandidate.push({pos: lastPos, context: 'current listen session'});
-            }
-            if(lastPos === undefined && this.listenRanges.length > 0) {
-                // may have just started a new listen session, or no listen session yet,
-                // after being paused/~stopped (session was closed) at the end of a playlist/repeat
-                //
-                // if we have a previous range then try the last end position
-                const last = this.listenRanges[this.listenRanges.length - 1].getPosition();
-                if(last !== undefined) {
-                    // no seek since session does not exist
-                    // but we have closed ranges so try latest end position
-                    lastPosCandidate.push({pos: last, context: 'last listen session'});
-                }
-                
-            }
-            if (trackDur !== undefined && lastPosCandidate.length > 0) {
-                for(const posData of lastPosCandidate) {
-                    const [nearEnd, nearEndHint] = closeToPlayEnd(currentPlay, posData.pos, {hintPrefix: false});
-                    // last position is close to end of Play
-                    if(nearEnd) {
-                        this.logger.verbose(`${repeatHint} ${[closeStartHint, `${posData.context} (${posData.pos}s) ${nearEndHint}`].join(' and ')}`);
-                        return true;
-                    }
-                }
-            }
+        const duration = this.currentPlay.data.duration;
+        const dropped = lastPos - newPosition;
+        if (dropped <= 0) {
+            return false;
         }
-        return false;
+        // Rewind detected if position dropped backwards by at least 50% or 4 minutes
+        // (reusing the exact symmetric threshold config that triggered the scrobble)
+        return timePassesScrobbleThreshold(this.thresholds, dropped, duration).passes;
     }
 
     protected setCurrentPlay(state: PlayerStateData, options?: CurrentPlayOptions) {
@@ -439,9 +392,10 @@ export abstract class AbstractPlayerState {
         const {play, position} = state;
 
         this.currentPlay = play;
-        this.playFirstSeenAt = reportedTS ?? dayjs();
+        this.playFirstSeenAt = reportedTS ?? play.data.playDate ?? dayjs();
         this.listenRanges = [];
         this.currentListenRange = undefined;
+        this.hasScrobbled = false;
 
         this.logger.verbose(`New Play: ${buildTrackString(play, {include: ['trackId', 'artist', 'track', 'session']})}`);
 
@@ -528,6 +482,7 @@ export abstract class AbstractPlayerState {
         newPlayer.listenRanges = this.listenRanges;
         newPlayer.playFirstSeenAt = this.playFirstSeenAt;
         newPlayer.playLastUpdatedAt = this.playLastUpdatedAt;
+        newPlayer.hasScrobbled = this.hasScrobbled;
     }
 }
 

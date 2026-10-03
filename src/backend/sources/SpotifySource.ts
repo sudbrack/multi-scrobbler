@@ -175,7 +175,10 @@ export default class SpotifySource extends MemoryPositionalSource implements Pag
             }
 
             scrobbleTsSOC = SCROBBLE_TS_SOC_START;
-            played_at = dayjs(timestamp);
+            const startTimestamp = (progress_ms !== null && progress_ms !== undefined)
+                ? timestamp - progress_ms
+                : timestamp;
+            played_at = dayjs(startTimestamp);
             artists = art;
             name = n;
             id = i;

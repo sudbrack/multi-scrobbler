@@ -3,7 +3,7 @@ import dayjs, { type Dayjs } from "dayjs";
 import { and, eq, inArray, isNull, relationsFilterToSQL, sql } from "drizzle-orm";
 import assert from "node:assert";
 import type { MarkOptional, ElementOf } from "ts-essentials";
-import { type DateLike, type DeepReplaceValue, type PlayObject, type PlayState, QUEUE_STATUS_QUEUED, type QueueName, SCROBBLE_TS_SOC_END, TA_DEFAULT_ACCURACY, type TemporalAccuracy } from "../../../../../core/Atomic.ts";
+import { type DateLike, type DeepReplaceValue, PARSED_FROM, type PlayObject, type PlayState, QUEUE_STATUS_QUEUED, type QueueName, SCROBBLE_TS_SOC_END, TA_DEFAULT_ACCURACY, type TemporalAccuracy } from "../../../../../core/Atomic.ts";
 import { removeUndefinedKeys } from '../../../../../core/DataUtils.ts';
 import { shortTodayAwareFormat } from "../../../../../core/TimeUtils.ts";
 import { playContentBasicInvariantTransform, playMbidIdentifier } from "../../../../utils/PlayComparisonUtils.ts";
@@ -962,36 +962,29 @@ export const getTemporallyCloseDateCompareOp = (play: PlayObject, opts: {bufferT
         useCompleted,
         useDuration,
     } = opts;
-        // we get all plays with a play date between playdate - (buffer) AND (playDateCompleted or playDate) + (buffer)
-        let startRange: Dayjs,
-        endRange: Dayjs;
+    let startRange: Dayjs,
+    endRange: Dayjs;
 
-        // make sure we use the 
-        const [sotPlayDate, SOT] = getScrobbleTsSOCDateWithContext(play);
-        const {playDate} = play.data;
+    const [sotPlayDate, SOT] = getScrobbleTsSOCDateWithContext(play);
+    const {playDate} = play.data;
+    const isLivePlayer = play.meta.parsedFrom === PARSED_FROM.player;
 
-        // if play has no playDate fallback to using SOT date (which defaults to now)
-        if(useDuration && play.data.duration !== undefined && playDate !== undefined) {
-            if(SOT === SCROBBLE_TS_SOC_END) {
-                endRange = playDate.add(bufferTime, 's');
-                startRange = playDate.subtract(play.data.duration + bufferTime,'s')
-            } else {
-                endRange = playDate.add(play.data.duration + bufferTime, 's');
-                startRange = playDate.subtract(bufferTime,'s')
-            }
-        } else if(play.data.playDateCompleted !== undefined && useCompleted && playDate !== undefined) {
-            startRange = playDate.subtract(bufferTime, 's');
-            // this will be present if source reports it
-            // or we tracked it live with MemorySource
-            endRange = play.data.playDateCompleted.add(bufferTime, 's');
-        } else {
-            startRange = sotPlayDate.subtract(bufferTime, 's');
-            endRange = sotPlayDate.add(bufferTime, 's');
-        }
-        return {
-            type: 'between',
-            range: [startRange, endRange]
-        }
+    if (!isLivePlayer && useDuration && SOT === SCROBBLE_TS_SOC_END && play.data.duration !== undefined && playDate !== undefined) {
+        endRange = playDate.add(bufferTime, 's');
+        startRange = playDate.subtract(play.data.duration + bufferTime, 's');
+    } else if (!isLivePlayer && play.data.playDateCompleted !== undefined && useCompleted && playDate !== undefined) {
+        startRange = playDate.subtract(bufferTime, 's');
+        endRange = play.data.playDateCompleted.add(bufferTime, 's');
+    } else {
+        const date = playDate ?? sotPlayDate;
+        const window = opts.bufferTime ?? 30;
+        startRange = date.subtract(window, 'seconds');
+        endRange = date.add(window, 'seconds');
+    }
+    return {
+        type: 'between',
+        range: [startRange, endRange]
+    }
 }
 
 export const buildPlayWith = (args: WithPlayRelation[] | undefined): FindWith<'plays'> | undefined => {

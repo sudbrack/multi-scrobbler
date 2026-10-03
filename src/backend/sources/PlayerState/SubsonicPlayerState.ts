@@ -52,14 +52,14 @@ export class SubsonicPlayerState extends PositionalPlayerState {
         return super.getPosition();
     }
 
-    protected isSessionRepeat(position?: number, reportedTS?: Dayjs) {
+    public isPositionRewind(newPosition?: number): boolean {
         if (this.activeRange?.isPositional()) {
-            return super.isSessionRepeat(position, reportedTS);
+            return super.isPositionRewind(newPosition);
         }
         // if track has a duration and the listened duration for this session is greater than 100% + 5% (for buffer)
         // then assume track is on repeat
         const duration = this.currentPlay?.data.duration;
-        if(duration !== undefined && this.getListenDuration() > (duration + (0.05 * duration))) {
+        if(this.hasScrobbled && duration !== undefined && this.getListenDuration() > (duration + (0.05 * duration))) {
             this.logger.debug('Listened duration for this session is over 105%, triggering as a repeat');
             return true;
         }

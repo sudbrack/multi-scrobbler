@@ -10,6 +10,7 @@ import { objectsEqual } from '../../utils/DataUtils.ts';
 import { sql } from 'drizzle-orm';
 import clone from 'clone';
 import { transientDb } from '../utils/TransientTestUtils.ts';
+import { PARSED_FROM } from '../../../core/Atomic.ts';
 
 describe('Repository Operations', function () {
 
@@ -276,6 +277,72 @@ describe('Repository Operations', function () {
             expect(existing, 'checkExisting should return the client play whose parent the clone is based off of').to.not.be.undefined;
             expect(existing!.id).eq(rowsB[0].id);
             expect(existing!.play.data.track).eq(childPlay.data.track);
+        });
+
+        it('checkExisting does not flag sequential replays (spaced by duration) as duplicates', async function () {
+            const db = await transientDb();
+            const component = await db.insert(components).values(fixtureCreateComponent()).returning();
+            const repo = new DrizzlePlayRepository(db, { componentId: component[0].id });
+
+            const play1 = generatePlay({
+                track: 'Repeat Song',
+                artists: [{ name: 'Repeat Artist' }],
+                duration: 200,
+                playDate: dayjs('2026-10-01T12:00:00Z')
+            }, {
+                source: 'spotify',
+                parsedFrom: PARSED_FROM.player
+            });
+
+            await repo.createPlays([{
+                ...fixtureCreatePlay({ play: play1 }),
+                state: 'queued' as const,
+                input: { data: generateRandomObj(undefined, { allowUndefined: false }) }
+            }]);
+
+            // Replay #2 starts 200s later (after duration)
+            const play2 = generatePlay({
+                track: 'Repeat Song',
+                artists: [{ name: 'Repeat Artist' }],
+                duration: 200,
+                playDate: dayjs('2026-10-01T12:03:20Z')
+            }, {
+                source: 'spotify',
+                parsedFrom: PARSED_FROM.player
+            });
+
+            const existing = await repo.checkExisting(play2);
+            expect(existing, 'Sequential replay spaced by duration should not match play1 as duplicate').to.be.undefined;
+        });
+
+        it('checkExisting correctly flags true duplicates within 30 seconds', async function () {
+            const db = await transientDb();
+            const component = await db.insert(components).values(fixtureCreateComponent()).returning();
+            const repo = new DrizzlePlayRepository(db, { componentId: component[0].id });
+
+            const play1 = generatePlay({
+                track: 'Dupe Song',
+                artists: [{ name: 'Dupe Artist' }],
+                duration: 200,
+                playDate: dayjs('2026-10-01T12:00:00Z')
+            }, {
+                source: 'spotify',
+                parsedFrom: PARSED_FROM.player
+            });
+
+            const created = await repo.createPlays([{
+                ...fixtureCreatePlay({ play: play1 }),
+                state: 'queued' as const,
+                input: { data: generateRandomObj(undefined, { allowUndefined: false }) }
+            }]);
+
+            // Duplicate arrives within 5 seconds (< 30s window)
+            const playDupe = clone(play1);
+            playDupe.data.playDate = play1.data.playDate!.add(5, 'seconds');
+
+            const existing = await repo.checkExisting(playDupe);
+            expect(existing, 'True duplicate within 30 seconds should match play1').to.not.be.undefined;
+            expect(existing!.id).to.eq(created[0].id);
         });
 
     });

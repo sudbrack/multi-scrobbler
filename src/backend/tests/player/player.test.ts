@@ -16,6 +16,7 @@ import { generatePlay } from "../../../core/tests/utils/PlayTestUtils.ts";
 import { PositionalPlayerState } from "../../sources/PlayerState/PositionalPlayerState.ts";
 import type { ListenProgressPositional } from "../../sources/PlayerState/ListenProgress.ts";
 import type { ListenRangePositional } from "../../sources/PlayerState/ListenRange.ts";
+import { timePassesScrobbleThreshold } from "../../utils/TimeUtils.ts";
 
 const logger = loggerTest;
 
@@ -28,8 +29,8 @@ class TestPositionalPlayerState extends PositionalPlayerState {
         const range = super.newListenRange(start, end, {allowedDrift: this.allowedDrift, rtImmediate: false, rtTruth: this.rtTruth, ...options});
         return range;
     }
-    public testSessionRepeat(position: number, reportedTS?: Dayjs) {
-        return this.isSessionRepeat(position, reportedTS);
+    public testPositionRewind(position: number) {
+        return this.isPositionRewind(position);
     }
 }
 
@@ -347,74 +348,149 @@ describe('Player listen ranges', function () {
             });
         });
 
-        describe('Detects repeating', function () {
-            it('Detects repeat when player was within 12 seconds of ending and seeked back to within 12 seconds of start', function () {
+        describe('Detects repeating and 50% scrobble threshold', function () {
+            it('scrobbles immediately when reaching 50% of duration', function () {
                 const player = new TestPositionalPlayerState(logger, [NO_DEVICE, NO_USER]);
+                const track = clone(newPlay);
+                track.data.duration = 300;
 
-                const positioned = clone(newPlay);
-                positioned.data.duration = 70;
-                player.update(testState({play: positioned, position: 45}));
+                // Start at position 0
+                player.update(testState({play: track, position: 0, status: REPORTED_PLAYER_STATUSES.playing}));
 
-                player.currentListenRange!.rtPlayer.setPosition(65000);
-                player.update(testState({play: positioned, position: 65}), dayjs().add(20, 'seconds'));
+                // Advance to 100s (< 50%)
+                player.currentListenRange!.rtPlayer.setPosition(100000);
+                const [, scrobble1] = player.update(testState({play: track, position: 100, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(100, 'seconds'));
+                assert.isUndefined(scrobble1, 'Should not scrobble before 50%');
+                assert.isFalse(player.hasScrobbled);
 
-                const isRepeat = player.testSessionRepeat(5,  dayjs().add(20, 'seconds'));
-                assert.isTrue(isRepeat);
-
-                player.currentListenRange!.rtPlayer.setPosition(67000);
-                const [curr, prevPlay] = player.update(testState({play: positioned, position: 5}), dayjs().add(22, 'seconds'));
-
-                assert.isDefined(prevPlay);
-                assert.isTrue(curr!.data.repeat)
-                assert.equal(player.getListenDuration(), 0);
+                // Advance to 150s (50%)
+                player.currentListenRange!.rtPlayer.setPosition(150000);
+                const [, scrobble2] = player.update(testState({play: track, position: 150, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(150, 'seconds'));
+                assert.isDefined(scrobble2, 'Should scrobble immediately at 50%');
+                assert.isTrue(player.hasScrobbled);
+                assert.equal(scrobble2!.data.listenedFor, 150);
             });
 
-            it('Detects repeat when player was within 15% of ending and seeked back to within 15% of start', function () {
+            it('preserves exact start playDate from play object when scrobbled', function () {
                 const player = new TestPositionalPlayerState(logger, [NO_DEVICE, NO_USER]);
+                const exactStart = dayjs('2026-10-01T11:59:30Z');
+                const track = generatePlay({
+                    duration: 300,
+                    playDate: exactStart
+                });
 
-                const positioned = clone(newPlay);
-                positioned.data.duration = 300;
+                // First polled at position 0
+                player.update(testState({play: track, position: 0, status: REPORTED_PLAYER_STATUSES.playing}));
 
-                player.update(testState({play: positioned, position: 351}));
-
-                player.currentListenRange!.rtPlayer.setPosition(361000);
-                player.update(testState({play: positioned, position: 361}), dayjs().add(10, 'seconds'));
-
-                player.currentListenRange!.rtPlayer.setPosition(371000);
-                player.update(testState({play: positioned, position: 371}), dayjs().add(20, 'seconds'));
-
-                const isRepeat = player.testSessionRepeat(20,  dayjs().add(30, 'seconds'));
-                assert.isTrue(isRepeat);
-
-                player.currentListenRange!.rtPlayer.setPosition(381000);
-                const [curr, prevPlay] = player.update(testState({play: positioned, position: 20}), dayjs().add(30, 'seconds'));
-
-                assert.isTrue(curr!.data.repeat);
-                assert.isDefined(prevPlay);
-                assert.equal(player.getListenDuration(), 0);
+                // Reaches 50% (150s)
+                player.currentListenRange!.rtPlayer.setPosition(150000);
+                const [, scrobble] = player.update(testState({play: track, position: 150, status: REPORTED_PLAYER_STATUSES.playing}));
+                assert.isDefined(scrobble);
+                assert.equal(scrobble!.data.playDate!.toISOString(), exactStart.toISOString());
             });
 
-            it('Detects repeat when player is seeked to start and a hefty chunk of the track has already been played', function () {
+            it('resets session and scrobbles second play when rewound after 50%', function () {
                 const player = new TestPositionalPlayerState(logger, [NO_DEVICE, NO_USER]);
+                const track = clone(newPlay);
+                track.data.duration = 300;
 
-                const positioned = clone(newPlay);
-                positioned.data.duration = 70;
+                // Start at 0
+                player.update(testState({play: track, position: 0, status: REPORTED_PLAYER_STATUSES.playing}));
 
-                player.update(testState({play: positioned, position: 0}));
+                // Advance to 150s (scrobble #1)
+                player.currentListenRange!.rtPlayer.setPosition(150000);
+                const [, scrobble1] = player.update(testState({play: track, position: 150, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(150, 'seconds'));
+                assert.isDefined(scrobble1);
+                assert.isTrue(player.hasScrobbled);
 
-                player.currentListenRange!.rtPlayer.setPosition(40000);
-                player.update(testState({play: positioned, position: 40}), dayjs().add(40, 'seconds'));
+                // Advance to 260s
+                player.currentListenRange!.rtPlayer.setPosition(260000);
+                const [, betweenScrobble] = player.update(testState({play: track, position: 260, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(260, 'seconds'));
+                assert.isUndefined(betweenScrobble);
 
-                const isRepeat = player.testSessionRepeat(2,  dayjs().add(50, 'seconds'));
-                assert.isTrue(isRepeat);
+                // Rewind back to 0:05 (dropped 255s >= 50%)
+                player.currentListenRange!.rtPlayer.setPosition(261000);
+                const [, prevRewind] = player.update(testState({play: track, position: 5, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(261, 'seconds'));
+                assert.isUndefined(prevRewind, 'Rewind resets session and does not emit old play again');
+                assert.isFalse(player.hasScrobbled, 'hasScrobbled should be reset to false for play #2');
+                assert.isTrue(player.isRepeatPlay, 'Should be flagged as repeat play');
+                assert.equal(player.getListenDuration(), 0, 'Listen duration should be reset to 0');
 
-                positioned.meta.trackProgressPosition = 2;
-                player.currentListenRange!.rtPlayer.setPosition(50000);
-                const [curr, prevPlay] = player.update(testState({play: positioned, position: 2}), dayjs().add(50, 'seconds'));
+                // Advance play #2 to 155s (150s listened from 5s)
+                player.currentListenRange!.rtPlayer.setPosition(155000);
+                const [, scrobble2] = player.update(testState({play: track, position: 155, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(411, 'seconds'));
+                assert.isDefined(scrobble2, 'Play #2 should scrobble when it reaches 50%');
+                assert.isTrue(player.hasScrobbled);
+                assert.isTrue(scrobble2!.data.repeat);
+            });
 
-                assert.isTrue(curr!.data.repeat)
-                assert.isDefined(prevPlay);
+            it('does not double-scrobble when track finishes after being scrobbled at 50%', function () {
+                const player = new TestPositionalPlayerState(logger, [NO_DEVICE, NO_USER]);
+                const track = clone(newPlay);
+                track.data.duration = 300;
+
+                // Start
+                player.update(testState({play: track, position: 0, status: REPORTED_PLAYER_STATUSES.playing}));
+
+                // Reach 50%
+                player.currentListenRange!.rtPlayer.setPosition(150000);
+                const [, scrobble1] = player.update(testState({play: track, position: 150, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(150, 'seconds'));
+                assert.isDefined(scrobble1);
+
+                // Continue to near end (290s)
+                player.currentListenRange!.rtPlayer.setPosition(290000);
+                const [, progress] = player.update(testState({play: track, position: 290, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(290, 'seconds'));
+                assert.isUndefined(progress);
+
+                // Transition to next track
+                const track2 = generatePlay({duration: 200});
+                track2.data.track = "Second Track";
+                player.currentListenRange!.rtPlayer.setPosition(300000);
+                const [, onTransition] = player.update(testState({play: track2, position: 0, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(300, 'seconds'));
+                assert.isUndefined(onTransition, 'Must not re-emit track on transition if already scrobbled at 50%');
+            });
+
+            it('handles rapid track switch (Song A -> Song B for 3s -> Song A) as two distinct plays of Song A', function () {
+                const player = new TestPositionalPlayerState(logger, [NO_DEVICE, NO_USER]);
+                const songA = clone(newPlay);
+                songA.data.track = "Song A";
+                songA.data.duration = 300;
+
+                const songB = clone(newPlay);
+                songB.data.track = "Song B";
+                songB.data.duration = 200;
+
+                // Song A starts at T=0
+                player.update(testState({play: songA, position: 0, status: REPORTED_PLAYER_STATUSES.playing}), dayjs('2026-10-01T12:00:00Z'));
+
+                // Song A reaches 50% at T=150s -> scrobbles Play #1
+                player.currentListenRange!.rtPlayer.setPosition(150000);
+                const [, scrobbleA1] = player.update(testState({play: songA, position: 150, status: REPORTED_PLAYER_STATUSES.playing}), dayjs('2026-10-01T12:02:30Z'));
+                assert.isDefined(scrobbleA1);
+                assert.equal(scrobbleA1!.data.track, "Song A");
+
+                // User skips to Song B at T=200s
+                player.currentListenRange!.rtPlayer.setPosition(200000);
+                const [, onSongBStart] = player.update(testState({play: songB, position: 0, status: REPORTED_PLAYER_STATUSES.playing}), dayjs('2026-10-01T12:03:20Z'));
+                assert.isUndefined(onSongBStart, 'Song A was already scrobbled');
+                assert.isFalse(player.hasScrobbled);
+
+                // After 3 seconds (T=203s), user clicks back to Song A
+                player.currentListenRange!.rtPlayer.setPosition(3000);
+                const [, onBackToA] = player.update(testState({play: songA, position: 0, status: REPORTED_PLAYER_STATUSES.playing}), dayjs('2026-10-01T12:03:23Z'));
+                assert.isDefined(onBackToA);
+                assert.equal(onBackToA!.data.track, 'Song B');
+                assert.isFalse(timePassesScrobbleThreshold({}, onBackToA!.data.listenedFor ?? 0, onBackToA!.data.duration).passes, 'Song B had not reached 50% and is discarded by MemorySource');
+                assert.isFalse(player.hasScrobbled, 'Song A play #2 starts fresh');
                 assert.equal(player.getListenDuration(), 0);
+
+                // Song A play #2 reaches 50% (position 150s, T=353s)
+                player.currentListenRange!.rtPlayer.setPosition(150000);
+                const [, scrobbleA2] = player.update(testState({play: songA, position: 150, status: REPORTED_PLAYER_STATUSES.playing}), dayjs('2026-10-01T12:05:53Z'));
+                assert.isDefined(scrobbleA2, 'Song A play #2 scrobbles at 50%');
+                assert.equal(scrobbleA2!.data.track, "Song A");
+                // Verify start timestamps are distinct (> 30s apart)
+                assert.isTrue(scrobbleA2!.data.playDate!.diff(scrobbleA1!.data.playDate!, 'seconds') > 30);
             });
 
             it('Resets repeat status when updated with non-matching play', function () {
@@ -423,26 +499,24 @@ describe('Player listen ranges', function () {
                 const positioned = clone(newPlay);
                 positioned.data.duration = 70;
 
-                player.update(testState({play: positioned, position: 0}));
+                player.update(testState({play: positioned, position: 0, status: REPORTED_PLAYER_STATUSES.playing}));
 
+                // Reach 50%+ (40s)
                 player.currentListenRange!.rtPlayer.setPosition(40000);
-                player.update(testState({play: positioned, position: 40}), dayjs().add(40, 'seconds'));
+                player.update(testState({play: positioned, position: 40, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(40, 'seconds'));
 
-                const isRepeat = player.testSessionRepeat(2,  dayjs().add(50, 'seconds'));
-                assert.isTrue(isRepeat);
+                // Rewind to 2s (dropped 38s >= 50%)
+                player.currentListenRange!.rtPlayer.setPosition(41000);
+                const [curr] = player.update(testState({play: positioned, position: 2, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(41, 'seconds'));
 
-                positioned.meta.trackProgressPosition = 2;
-                player.currentListenRange!.rtPlayer.setPosition(50000);
-                const [curr, prevPlay] = player.update(testState({play: positioned, position: 2}), dayjs().add(50, 'seconds'));
+                assert.isTrue(curr!.data.repeat);
+                assert.isTrue(player.isRepeatPlay);
 
-                assert.isTrue(curr!.data.repeat)
-                assert.isDefined(prevPlay);
-                assert.equal(player.getListenDuration(), 0);
+                // Update with non-matching play
+                player.currentListenRange!.rtPlayer.setPosition(45000);
+                const [currNew, prevPlayRepeat] = player.update(testState({play: generatePlay(), position: 1, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(45, 'seconds'));
 
-                player.currentListenRange!.rtPlayer.setPosition(55000);
-                const [currNew, prevPlayRepeat] = player.update(testState({play: generatePlay(), position: 1}), dayjs().add(55, 'seconds'));
-
-                assert.isDefined(prevPlayRepeat)
+                assert.isDefined(prevPlayRepeat);
                 assert.isTrue(prevPlayRepeat.data.repeat);
                 assert.isDefined(currNew);
                 assert.isFalse(currNew.data.repeat);

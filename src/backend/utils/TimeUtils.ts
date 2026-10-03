@@ -19,10 +19,6 @@ import {
 } from "../../core/Atomic.ts";
 import { capitalize, stringIsOnlyNumbers } from "../../core/StringUtils.ts";
 import {
-    DEFAULT_CLOSE_POSITION_ABSOLUTE,
-    DEFAULT_CLOSE_POSITION_PERCENT,
-    DEFAULT_DURATION_REPEAT_ABSOLUTE,
-    DEFAULT_DURATION_REPEAT_PERCENT,
     DEFAULT_SCROBBLE_DURATION_THRESHOLD,
     DEFAULT_SCROBBLE_PERCENT_THRESHOLD,
     type DurationValue,
@@ -215,9 +211,13 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
 
     }
 
+    const isSequentialPlay = existingTsSOC === candidateTsSOC && candidateTsSOCDate.isAfter(existingTsSOCDate);
+
     // if the source has a duration its possible one play was scrobbled at the beginning of the track and the other at the end
     // so check if the duration matches the diff between the two play dates
-    if (result.match === TA_NONE && referenceDuration !== undefined) {
+    // Only perform fuzzy duration matching if candidate playDate is NOT sequentially after existingPlayDate
+    // Two consecutive plays of the same song have diff ≈ duration, which is NOT a duplicate!
+    if (result.match === TA_NONE && referenceDuration !== undefined && !isSequentialPlay) {
         result.date.fuzzyDurationDiff = Math.abs(scrobblePlayDiff - referenceDuration);
         if (result.date.fuzzyDurationDiff <= fuzzyDiffThreshold) { // TODO use finer comparison for this?
             result.match = TA_FUZZY;
@@ -226,7 +226,7 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
     // if the source has listened duration (maloja) it may differ from actual track duration
     // and its possible (spotify) the candidate play date is set at the end of this duration
     // so check if there is a close match between candidate play date and source + listened for
-    if (result.match === TA_NONE && referenceListenedFor !== undefined && fuzzyDuration) {
+    if (result.match === TA_NONE && referenceListenedFor !== undefined && fuzzyDuration && !isSequentialPlay) {
         result.date.fuzzyListenedDiff = Math.abs(scrobblePlayDiff - referenceListenedFor);
         if (result.date.fuzzyListenedDiff <= fuzzyDiffThreshold) { // TODO use finer comparison for this?
             result.match = TA_FUZZY
@@ -348,84 +348,6 @@ export const parseDurationFromTimestamp = (timestamp: any) => {
         milliseconds: Number.parseInt(milli)
     });
 };
-
-/** Is Position earlier than X seconds or Y% percent of the start of a Play? */
-export const closeToPlayStart = (play: PlayObject, position: number, thresholds: {absolute?: number, percent?: number, hintPrefix?: boolean} = {}): [boolean, string] => {
-    const {
-        absolute = DEFAULT_CLOSE_POSITION_ABSOLUTE,
-        percent = DEFAULT_CLOSE_POSITION_PERCENT,
-        hintPrefix = true
-    } = thresholds;
-
-        const hintStart = hintPrefix ? `Position (${position}) ` : '';
-        const trackDur = play.data.duration;
-        const closeStartNum = position <= absolute;
-        const hints: string[] = [];
-        hints.push(`${closeStartNum ? 'is' : 'is not'} within ${absolute}s of track start`);
-
-        let closeStartPer = false;
-        if(trackDur !== undefined) {
-            const positionPercent = (position / trackDur);
-            closeStartPer = (positionPercent <= percent);
-            if(!closeStartNum) {
-                hints.push(`${closeStartPer ? 'is' : 'is not'} within ${formatNumber(percent * 100, {toFixed: 0})}% of track start (${formatNumber(positionPercent*100)}%)`);
-            }
-        }
-
-        return [closeStartNum || closeStartPer, `${hintStart}${hints.join(' and ')}`];
-}
-
-/** Is Position closer than X seconds or Y% percent of the end of a Play? */
-export const closeToPlayEnd = (play: PlayObject, position: number, thresholds: {absolute?: number, percent?: number, hintPrefix?: boolean} = {}): [boolean, string] => {
-    const {
-        absolute = DEFAULT_CLOSE_POSITION_ABSOLUTE,
-        percent = DEFAULT_CLOSE_POSITION_PERCENT,
-        hintPrefix = true
-    } = thresholds;
-
-        const hintStart = hintPrefix ? `Position (${position}) ` : '';
-        const trackDur = play.data.duration;
-
-        if(trackDur === undefined) {
-            return [false, `Cannot determine how close Position ${position} is to end of track because no duration data is available.`];
-        }
-
-        const nearEndNum = trackDur - position <= absolute;
-        const hints: string[] = [];
-        hints.push(`${nearEndNum ? 'is' : 'is not'} within ${absolute}s of track end`);
-        const positionPercent = 1 - (position / trackDur);
-        const nearEndPer = (positionPercent < percent);
-        if(!nearEndNum) {
-            hints.push(`${nearEndPer ? 'is' : 'is not'} within ${formatNumber(percent * 100, {toFixed: 0})}% of track end (${formatNumber(positionPercent*100)}%)`);
-        }
-        return [nearEndNum || nearEndPer, `${hintStart}${hints.join(' and ')}`];
-}
-
-/** Has more than X seconds or Y% percent of Play duration been played? */
-export const repeatDurationPlayed = (play: PlayObject, duration: number, thresholds: {absolute?: number, percent?: number, hintPrefix?: boolean} = {}): [boolean, string] => {
-    const {
-        absolute =  DEFAULT_DURATION_REPEAT_ABSOLUTE,
-        percent = DEFAULT_DURATION_REPEAT_PERCENT,
-        hintPrefix = true
-    } = thresholds;
-
-        const hintStart = hintPrefix ? `Duration listened (${duration}s) ` : '';
-        const trackDur = play.data.duration;
-        const absPlayed = duration >= absolute;
-        const hints: string[] = [];
-        hints.push(`${absPlayed ? 'is' : 'is not'} more than ${absolute}s`);
-
-        let majorityDurationPercent = false;
-        if(trackDur !== undefined) {
-            const durationPercent = (duration / trackDur);
-            majorityDurationPercent = (durationPercent >= percent);
-            if(!absPlayed) {
-                hints.push(`${majorityDurationPercent ? 'is' : 'is not'} more than ${formatNumber(percent * 100, {toFixed: 0})}% of track duration (${formatNumber(durationPercent*100)}%)`);
-            }
-        }
-
-        return [absPlayed || majorityDurationPercent, `${hintStart}${hints.join(' and ')}`];
-}
 
 /** Convert unix timestamp in microseconds to unix timestamp in seconds */
 export const usecToUnix = (usec: number): UnixTimestamp => {
