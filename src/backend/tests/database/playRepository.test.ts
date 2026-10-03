@@ -10,7 +10,7 @@ import { objectsEqual } from '../../utils/DataUtils.ts';
 import { sql } from 'drizzle-orm';
 import clone from 'clone';
 import { transientDb } from '../utils/TransientTestUtils.ts';
-import { PARSED_FROM } from '../../../core/Atomic.ts';
+import { PARSED_FROM, SCROBBLE_TS_SOC_START } from '../../../core/Atomic.ts';
 
 describe('Repository Operations', function () {
 
@@ -342,6 +342,57 @@ describe('Repository Operations', function () {
 
             const existing = await repo.checkExisting(playDupe);
             expect(existing, 'True duplicate within 30 seconds should match play1').to.not.be.undefined;
+            expect(existing!.id).to.eq(created[0].id);
+        });
+
+        it('matches Spotify Backlog play whose playDate is aligned to start time against live player play', async function () {
+            const db = await transientDb();
+            const component = await db.insert(components).values(fixtureCreateComponent()).returning();
+            const repo = new DrizzlePlayRepository(db, { componentId: component[0].id });
+
+            const start = dayjs('2026-10-01T12:00:00Z');
+            const trackDuration = 180; // 3 min
+
+            // Live Player play recorded at start timestamp
+            const playerPlay = generatePlay({
+                track: 'Live Track',
+                artists: [{ name: 'Artist' }],
+                album: 'Test Album',
+                duration: trackDuration,
+                playDate: start,
+                playDateCompleted: start.add(trackDuration, 'seconds'),
+                listenedFor: trackDuration,
+            }, {
+                source: 'spotify',
+                parsedFrom: PARSED_FROM.player,
+                scrobbleTsSOC: SCROBBLE_TS_SOC_START
+            });
+
+            const created = await repo.createPlays([{
+                ...fixtureCreatePlay({ play: playerPlay }),
+                state: 'queued' as const,
+                input: { data: generateRandomObj(undefined, { allowUndefined: false }) }
+            }]);
+
+            // Spotify Backlog play from history API (played_at = 12:03:00, aligned to start = 12:00:00)
+            const backlogPlay = generatePlay({
+                track: 'Live Track',
+                artists: [{ name: 'Artist' }],
+                album: 'Test Album',
+                duration: trackDuration,
+                playDate: start.add(1, 'second'), // within 1s due to timing
+                playDateCompleted: start.add(trackDuration, 'seconds'),
+            }, {
+                source: 'spotify',
+                parsedFrom: PARSED_FROM.backlog,
+                scrobbleTsSOC: SCROBBLE_TS_SOC_START
+            });
+
+            const existing = await repo.checkExisting(backlogPlay, {
+                inputHash: backlogPlay,
+                seenAt: { type: 'lt', date: dayjs() }
+            });
+            expect(existing, 'Backlog play aligned to start time should match live player play').to.not.be.undefined;
             expect(existing!.id).to.eq(created[0].id);
         });
 

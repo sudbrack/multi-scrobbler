@@ -527,13 +527,16 @@ export const existingScrobble = async (playObjPre: PlayObject, existingScrobbles
                 return result;
             }
 
-            // only check for fuzzy if we know this play is NOT a repeat
+            const candidateConfirmedLive = playObj.meta.newFromSource === true
+                || (playObj.data.listenRanges !== undefined && playObj.data.listenRanges.length > 0);
+
+            // only check for fuzzy if we know this play is NOT a repeat or live-tracked
             // otherwise we may get a false positive on the previously played track ending time == repeat start time
             // -- this is info we only know if play was generated from MS player so we can be reasonably sure
             //
             // OR if play was generated from a source that uses History (endpoint sources, lfm or lz history sources)
             // then we can be reasonably sure that our candidate play has an accurate timestamp and wouldn't fuzzy match a previous scrobble
-            const looseTimeAccuracy = playObj.data.repeat || (playObj.meta.sourceSOT !== undefined && ([SOURCE_SOT.HISTORY, SOURCE_SOT.INGRESS] as SOURCE_SOT_TYPES[]).includes(playObj.meta.sourceSOT)) ? [TA_DURING] : [TA_FUZZY, TA_DURING];
+            const looseTimeAccuracy = playObj.data.repeat || candidateConfirmedLive || (playObj.meta.sourceSOT !== undefined && ([SOURCE_SOT.HISTORY, SOURCE_SOT.INGRESS] as SOURCE_SOT_TYPES[]).includes(playObj.meta.sourceSOT)) ? [TA_DURING] : [TA_FUZZY, TA_DURING];
 
             
             existingScrobble = await findAsyncSequential(existingScrobbles, async (xPre) => {
@@ -547,8 +550,6 @@ export const existingScrobble = async (playObjPre: PlayObject, existingScrobbles
                 // was actually live-tracked (has real listenRanges) then also accept a candidate whose
                 // timestamp simply falls within that play's own start-to-duration window, since that gap
                 // can't exceed the track's own length for a genuine duplicate of the same listen
-                const candidateConfirmedLive = playObj.meta.newFromSource === true
-                    || (playObj.data.listenRanges !== undefined && playObj.data.listenRanges.length > 0);
                 const existingIsLiveTracked = x.data.listenRanges !== undefined && x.data.listenRanges.length > 0;
                 const duringReferences: AcceptableTemporalDuringReference | undefined = !candidateConfirmedLive && existingIsLiveTracked
                     ? ['range', 'listenedFor', 'duration']

@@ -211,7 +211,10 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
 
     }
 
-    const isSequentialPlay = existingTsSOC === candidateTsSOC && candidateTsSOCDate.isAfter(existingTsSOCDate);
+    const candidateConfirmedLive = candidatePlay.meta.newFromSource === true
+        || (candidatePlay.data.listenRanges !== undefined && candidatePlay.data.listenRanges.length > 0);
+    const hasExplicitStart = existingPlay.meta.scrobbleTsSOC === SCROBBLE_TS_SOC_START && candidatePlay.meta.scrobbleTsSOC === SCROBBLE_TS_SOC_START;
+    const isSequentialPlay = candidateTsSOCDate.isAfter(existingTsSOCDate) && (candidatePlay.data.repeat || candidateConfirmedLive || hasExplicitStart);
 
     // if the source has a duration its possible one play was scrobbled at the beginning of the track and the other at the end
     // so check if the duration matches the diff between the two play dates

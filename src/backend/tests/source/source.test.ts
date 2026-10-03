@@ -4,7 +4,7 @@ import asPromised from 'chai-as-promised';
 import { describe, it } from 'mocha';
 import pEvent from "p-event";
 import clone from 'clone';
-import type {PlayObject} from "../../../core/Atomic.ts";
+import { type PlayObject, SCROBBLE_TS_SOC_START } from "../../../core/Atomic.ts";
 import { generatePlay, generatePlayerStateData, generatePlays, normalizePlays } from "../../../core/tests/utils/PlayTestUtils.ts";
 import { TestMemoryPositionalSource, TestMemorySource, TestSource } from "./TestSource.ts";
 import spotifyPayload from '../plays/spotifyCurrentPlaybackState.json' with { type: "json" };
@@ -209,6 +209,19 @@ describe('Sources correctly parse incoming payloads', function () {
         expect(artistCreditsToNames(identicalArtistsPlay.data.artists!)).eql(['Dubmood', 'MASTER BOOT RECORD']);
         expect(artistCreditsToNames(identicalArtistsPlay.data.albumArtists!)).to.be.empty;
     });
+
+    it('Spotify parses play history payload and aligns timestamp back to start', function() {
+        const historyPayload: SpotifyApi.PlayHistoryObject = {
+            track: clone(spotifyPayload.item) as unknown as SpotifyApi.TrackObjectFull,
+            played_at: '2026-10-03T05:14:03.000Z',
+            context: null as unknown as SpotifyApi.ContextObject
+        };
+        const play = SpotifySource.formatPlayObj(historyPayload);
+        expect(play.meta.scrobbleTsSOC).eq(SCROBBLE_TS_SOC_START);
+        expect(play.data.playDateCompleted?.toISOString()).eq('2026-10-03T05:14:03.000Z');
+        const expectedStart = dayjs('2026-10-03T05:14:03.000Z').subtract(historyPayload.track.duration_ms, 'millisecond');
+        expect(play.data.playDate?.toISOString()).eq(expectedStart.toISOString());
+    });
 });
 
 describe('Player Cleanup', function () {
@@ -230,6 +243,7 @@ describe('Player Cleanup', function () {
         let position = 0;
         let timeSince = 0;
 
+        const discovered: PlayObject[] = [];
         // simulate polling playing source for 30 seconds, 10 second interval
         for(let i = 0; i < 3; i++) {
             position += 10;
@@ -237,7 +251,7 @@ describe('Player Cleanup', function () {
             MockDate.set(initialDate.add(position, 'seconds').toDate());
             await sleep(1);
             const advancedState = generatePlayerStateData({play: initialState.play, stateUpdatedAt: dayjs(), position, status: REPORTED_PLAYER_STATUSES.playing});
-            expect((await source.processRecentPlays([advancedState])).length).to.be.eq(0);
+            discovered.push(...(await source.processRecentPlays([advancedState])));
         }
 
         // simulate polling another 20 seconds without any updates from the Source
@@ -251,9 +265,10 @@ describe('Player Cleanup', function () {
         MockDate.set(initialDate.add(timeSince + 2, 'seconds').toDate());
         await sleep(1);
         const discoveredPlays = await source.processRecentPlays([]);
+        discovered.push(...discoveredPlays);
         // cleanup should discover stale play
-        expect(discoveredPlays.length).to.be.eq(1);
-        expect(discoveredPlays[0].data.listenedFor).closeTo(30, 2);
+        expect(discovered.length).to.be.eq(1);
+        expect(discovered[0].data.listenedFor).closeTo(30, 2);
     } 
 
     it('Discovers cleaned up Play with correct duration (Non Positional Source)', async function () {
@@ -274,6 +289,7 @@ describe('Player Cleanup', function () {
         let position = 0;
         let timeSince = 0;
 
+        const firstDiscovered: PlayObject[] = [];
         // simulate polling playing source for 30 seconds, 10 second interval
         for(let i = 0; i < 3; i++) {
             position += 10;
@@ -281,7 +297,7 @@ describe('Player Cleanup', function () {
             MockDate.set(initialDate.add(position, 'seconds').toDate());
             await sleep(1);
             const advancedState = generatePlayerStateData({play: initialState.play, stateUpdatedAt: dayjs(), position, status: REPORTED_PLAYER_STATUSES.playing});
-            expect((await source.processRecentPlays([advancedState])).length).to.be.eq(0);
+            firstDiscovered.push(...(await source.processRecentPlays([advancedState])));
         }
 
         // simulate polling another 20 seconds without any updates from the Source
@@ -297,9 +313,10 @@ describe('Player Cleanup', function () {
         MockDate.set(initialDate.add(timeSince, 'seconds').toDate());
         await sleep(1);
         const discoveredPlays = await source.processRecentPlays([]);
-        // cleanup should discover stale play
-        expect(discoveredPlays.length).to.be.eq(1);
-        expect(discoveredPlays[0].data.listenedFor).closeTo(30, 2);
+        firstDiscovered.push(...discoveredPlays);
+        // should have discovered play exactly once (either at 50% threshold or on cleanup)
+        expect(firstDiscovered.length).to.be.eq(1);
+        expect(firstDiscovered[0].data.listenedFor).closeTo(30, 2);
 
         timeSince += 10;
 
@@ -419,6 +436,7 @@ describe('Player Cleanup', function () {
         position -= 9;
 
         // simulate ~50 seconds of listening (enough for scrobble)
+        const discovered: PlayObject[] = [];
         MockDate.set(initialDate.add(timeSince, 'seconds').toDate());
         for(let i = 0; i < 5; i++) {
             position += 10;
@@ -426,7 +444,7 @@ describe('Player Cleanup', function () {
             MockDate.set(initialDate.add(timeSince, 'seconds').toDate());
             await sleep(1);
             const advancedState = generatePlayerStateData({play: initialState.play, stateUpdatedAt: dayjs(), position, status: REPORTED_PLAYER_STATUSES.playing});
-            expect((await source.processRecentPlays([advancedState])).length).to.be.eq(0);
+            discovered.push(...(await source.processRecentPlays([advancedState])));
         }
 
         timeSince += 10;
@@ -434,10 +452,9 @@ describe('Player Cleanup', function () {
         await sleep(1);
         // new Play
         const advancedState = generatePlayerStateData({stateUpdatedAt: dayjs(), position: 0, status: REPORTED_PLAYER_STATUSES.playing});
-        // should return discovered play with ~90 seconds of duration
-        const plays = await source.processRecentPlays([advancedState])
-        expect(plays.length).to.be.eq(1);
-        expect(plays[0].data.duration).to.be.closeTo(90, 2);
+        discovered.push(...(await source.processRecentPlays([advancedState])));
+        expect(discovered.length).to.be.eq(1);
+        expect(discovered[0].data.duration).to.be.closeTo(90, 2);
 
     }
 

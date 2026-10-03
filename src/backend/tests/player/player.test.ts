@@ -346,6 +346,32 @@ describe('Player listen ranges', function () {
                 assert.isTrue(isSeeked);
                 assert.equal(time, -3000)
             });
+
+            it('allows listen duration and percentage to exceed 100% (e.g. 109%) when seeking backwards', function () {
+                const player = new TestPositionalPlayerState(logger, [NO_DEVICE, NO_USER]);
+                const track = clone(newPlay);
+                track.data.duration = 100;
+
+                // Start at 0s
+                player.update(testState({play: track, position: 0, status: REPORTED_PLAYER_STATUSES.playing}));
+
+                // Listen to 80s (80s listened)
+                player.currentListenRange!.rtPlayer.setPosition(80000);
+                player.update(testState({play: track, position: 80, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(80, 'seconds'));
+                assert.equal(player.getListenDuration(), 80);
+
+                // User seeks back 20s to position 60s (drop of 20s < 50s threshold, treated as seeking)
+                player.currentListenRange!.rtPlayer.setPosition(60000);
+                player.update(testState({play: track, position: 60, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(81, 'seconds'));
+
+                // User continues listening to 89s (another 29s listened: 80 + 29 = 109s)
+                player.currentListenRange!.rtPlayer.setPosition(89000);
+                player.update(testState({play: track, position: 89, status: REPORTED_PLAYER_STATUSES.playing}), dayjs().add(110, 'seconds'));
+
+                assert.equal(player.getListenDuration(), 109);
+                const percent = Math.round((player.getListenDuration() / track.data.duration) * 100);
+                assert.equal(percent, 109);
+            });
         });
 
         describe('Detects repeating and 50% scrobble threshold', function () {

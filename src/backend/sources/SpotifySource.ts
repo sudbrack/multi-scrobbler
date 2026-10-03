@@ -131,9 +131,9 @@ export default class SpotifySource extends MemoryPositionalSource implements Pag
                 delete obj.track.album?.available_markets;
             }
 
-            scrobbleTsSOC = SCROBBLE_TS_SOC_END;
-            played_at = dayjs(pa);
-            playDateCompleted = played_at;
+            scrobbleTsSOC = SCROBBLE_TS_SOC_START;
+            playDateCompleted = dayjs(pa);
+            played_at = dm !== undefined ? dayjs(pa).subtract(dm, 'millisecond') : dayjs(pa);
             artists = art;
             name = n;
             id = i;
@@ -409,12 +409,7 @@ export default class SpotifySource extends MemoryPositionalSource implements Pag
             }
         }
         const newPlays = await this.processRecentPlays(plays);
-        // hint that scrobble timestamp source of truth should be when the track ended (player changed tracks)
-        // rather than when we first saw the track
-        //
-        // this is because Spotify play history (getMyRecentlyPlayedTracks) timestamps based on end of play
-        // and when we backlog we want timestamps to be as accurate as possible
-        return newPlays.map(x => ({...x, meta: {...x.meta, scrobbleTsSOC: SCROBBLE_TS_SOC_END}}))
+        return newPlays;
     }
 
     getPaginatedUnitOfTime(): dayjs.ManipulateType {

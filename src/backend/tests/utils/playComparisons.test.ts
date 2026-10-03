@@ -5,7 +5,7 @@ import { describe, it } from 'mocha';
 import { existingScrobble, genericSourcePlayMatch, playsAreAddedOnly, playsAreBumpedOnly, playsAreSortConsistent } from "../../utils/PlayComparisonUtils.ts";
 import { generatePlay, generatePlays } from "../../../core/tests/utils/PlayTestUtils.ts";
 import { artistNamesToCredits } from "../../../core/StringUtils.ts";
-import { SCROBBLE_TS_SOC_END, type PlayObject } from "../../../core/Atomic.ts";
+import { SCROBBLE_TS_SOC_END, SCROBBLE_TS_SOC_START, type PlayObject } from "../../../core/Atomic.ts";
 
 const newPlay = generatePlay();
 
@@ -363,6 +363,97 @@ describe('Compare lists by order', function () {
 
                 const res = await existingScrobble(pausedBacklogCandidate, [pausedLiveTrackedPlay]);
                 assert.isTrue(res.match, 'a backlog candidate inside the real (paused) completion window should match even past nominal duration');
+            });
+
+            it('does NOT match a live replay whose start timestamp is separated from previous play by approximately duration', async function() {
+                // Existing play scrobbled at 04:56:50 with 240s duration (e.g. from Last.fm API or history)
+                const existingScrobblePlay: PlayObject = generatePlay({
+                    track: 'Take a Slice',
+                    artists: artistNamesToCredits(['Glass Animals']),
+                    duration: 240,
+                    playDate: dayjs('2026-10-03T04:56:50-05:00'),
+                });
+
+                // User rewound at 51% and replayed full through; candidate starts at 05:00:41 (231s diff, 9s fuzzy diff)
+                const candidateReplay: PlayObject = generatePlay({
+                    track: 'Take a Slice',
+                    artists: artistNamesToCredits(['Glass Animals']),
+                    duration: 240,
+                    playDate: dayjs('2026-10-03T05:00:41-05:00'),
+                    listenRanges: [
+                        { start: { timestamp: dayjs('2026-10-03T05:00:41-05:00') }, end: { timestamp: dayjs('2026-10-03T05:02:41-05:00') } }
+                    ]
+                }, {
+                    newFromSource: true
+                });
+
+                const res = await existingScrobble(candidateReplay, [existingScrobblePlay]);
+                assert.isFalse(res.match, 'a live replay starting ~duration after previous play must NOT be flagged as dupe');
+            });
+            it('matches Spotify Backlog play at completion timestamp with live Player play at start timestamp', async function() {
+                const start = dayjs('2026-10-03T05:10:52-05:00');
+                const existingPlayerPlay: PlayObject = generatePlay({
+                    track: 'For The Night (feat. Lil Baby & DaBaby)',
+                    artists: artistNamesToCredits(['Pop Smoke', 'Lil Baby', 'DaBaby']),
+                    duration: 190,
+                    playDate: start,
+                    listenedFor: 95,
+                    listenRanges: [
+                        { start: { timestamp: start }, end: { timestamp: start.add(95, 's') } }
+                    ]
+                }, {
+                    parsedFrom: 'player',
+                    source: 'Spotify',
+                    scrobbleTsSOC: SCROBBLE_TS_SOC_END
+                });
+
+                const backlogCandidate: PlayObject = generatePlay({
+                    track: 'For The Night',
+                    artists: artistNamesToCredits(['Pop Smoke', 'Lil Baby', 'DaBaby']),
+                    duration: 190,
+                    playDate: dayjs('2026-10-03T05:14:03-05:00'),
+                    playDateCompleted: dayjs('2026-10-03T05:14:03-05:00'),
+                }, {
+                    parsedFrom: 'backlog',
+                    source: 'Spotify',
+                    scrobbleTsSOC: SCROBBLE_TS_SOC_END
+                });
+
+                const res = await existingScrobble(backlogCandidate, [existingPlayerPlay]);
+                assert.isTrue(res.match);
+            });
+
+            it('matches Spotify Backlog play aligned to start timestamp with live Player play at start timestamp', async function() {
+                const start = dayjs('2026-10-03T05:10:52-05:00');
+                const existingPlayerPlay: PlayObject = generatePlay({
+                    track: 'For The Night (feat. Lil Baby & DaBaby)',
+                    artists: artistNamesToCredits(['Pop Smoke', 'Lil Baby', 'DaBaby']),
+                    duration: 190,
+                    playDate: start,
+                    listenedFor: 95,
+                    listenRanges: [
+                        { start: { timestamp: start }, end: { timestamp: start.add(95, 's') } }
+                    ]
+                }, {
+                    parsedFrom: 'player',
+                    source: 'Spotify',
+                    scrobbleTsSOC: SCROBBLE_TS_SOC_START
+                });
+
+                const backlogCandidate: PlayObject = generatePlay({
+                    track: 'For The Night',
+                    artists: artistNamesToCredits(['Pop Smoke', 'Lil Baby', 'DaBaby']),
+                    duration: 190,
+                    playDate: dayjs('2026-10-03T05:14:03-05:00').subtract(190, 'seconds'),
+                    playDateCompleted: dayjs('2026-10-03T05:14:03-05:00'),
+                }, {
+                    parsedFrom: 'backlog',
+                    source: 'Spotify',
+                    scrobbleTsSOC: SCROBBLE_TS_SOC_START
+                });
+
+                const res = await existingScrobble(backlogCandidate, [existingPlayerPlay]);
+                assert.isTrue(res.match);
             });
         });
 
