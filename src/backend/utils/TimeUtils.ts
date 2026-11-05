@@ -177,7 +177,10 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
             && (existingPlay.data.duration !== undefined || existingPlay.data.listenedFor !== undefined)
         ) {
             const listenedOffset = existingPlay.data.listenedFor ?? 0;
-            const windowStart = existingPlayDate.add(listenedOffset, 's').subtract(30, 's');
+            const minCompletionOffset = (existingRanges !== undefined && existingRanges.length > 1)
+                ? Math.min(listenedOffset, 30)
+                : listenedOffset;
+            const windowStart = existingPlayDate.add(minCompletionOffset, 's').subtract(30, 's');
 
             let baseEnd = existingPlayDate.add(Math.max(existingPlay.data.duration ?? 0, listenedOffset), 's');
             if (existingPlay.data.playDateCompleted !== undefined && existingPlay.data.playDateCompleted.isAfter(baseEnd)) {
@@ -185,8 +188,10 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
             }
             try {
                 if (existingRanges !== undefined && existingRanges.length > 0) {
-                    const lastRangeEnd = existingRanges[existingRanges.length - 1].end.timestamp;
-                    const remainingDuration = Math.max(0, (existingPlay.data.duration ?? 0) - listenedOffset);
+                    const lastRange = existingRanges[existingRanges.length - 1];
+                    const lastRangeEnd = lastRange.end.timestamp;
+                    const progressOffset = lastRange.end.position ?? listenedOffset;
+                    const remainingDuration = Math.max(0, (existingPlay.data.duration ?? 0) - progressOffset);
                     const projectedEnd = lastRangeEnd.add(remainingDuration, 's');
                     if (projectedEnd.isAfter(baseEnd)) {
                         baseEnd = projectedEnd;

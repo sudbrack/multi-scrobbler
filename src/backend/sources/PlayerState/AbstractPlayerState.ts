@@ -410,13 +410,11 @@ export abstract class AbstractPlayerState {
         const threshold = (trackDur !== undefined && trackDur > 0)
             ? Math.min(trackDur * (percentThreshold / 100), durationThreshold)
             : durationThreshold;
-        const maxStart = (trackDur !== undefined && trackDur > 0)
-            ? Math.max(30, trackDur * 0.15)
-            : 30;
+        const maxStart = 30;
         const dropped = lastPos - position;
 
         if (dropped >= threshold && position <= maxStart) {
-            this.logger.verbose(`New Position (${position}s) rewound ${formatNumber(dropped, {toFixed: 1})}s (threshold ${formatNumber(threshold, {toFixed: 1})}s) to within first ${formatNumber(maxStart, {toFixed: 1})}s of track after scrobbling`);
+            this.logger.verbose(`New Position (${position}s) rewound ${formatNumber(dropped, {toFixed: 1})}s (threshold ${formatNumber(threshold, {toFixed: 1})}s) to within first ${maxStart}s of track after scrobbling`);
             return true;
         }
 

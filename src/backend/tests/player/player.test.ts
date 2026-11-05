@@ -601,14 +601,14 @@ describe('Player listen ranges', function () {
                     const player = new TestPositionalPlayerState(logger, [NO_DEVICE, NO_USER]);
                     const start = dayjs();
                     const positioned = clone(newPlay);
-                    positioned.data.duration = 720; // 12 minutes; threshold = 240s, start guard = max(30, 108) = 108s
+                    positioned.data.duration = 720; // 12 minutes; threshold = 240s, start guard = 30s
 
                     player.update(testState({play: positioned, position: 0, status: REPORTED_PLAYER_STATUSES.playing}), start);
                     player.currentListenRange!.rtPlayer.setPosition(480000);
                     player.update(testState({play: positioned, position: 480, status: REPORTED_PLAYER_STATUSES.playing}), start.add(480, 'seconds'));
                     assert.isTrue(player.hasScrobbled);
 
-                    // Rewind from 8:00 (480s) to 3:30 (210s): dropped 270s (>= 240s), but 210s > 108s start guard
+                    // Rewind from 8:00 (480s) to 3:30 (210s): dropped 270s (>= 240s), but 210s > 30s start guard
                     player.currentListenRange!.rtPlayer.setPosition(481000);
                     const [curr, prevPlay] = player.update(testState({play: positioned, position: 210, status: REPORTED_PLAYER_STATUSES.playing}), start.add(481, 'seconds'));
                     assert.isUndefined(prevPlay);

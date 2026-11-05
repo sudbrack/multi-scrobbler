@@ -1014,5 +1014,112 @@ describe('Spotify - 50% Scrobbling, Replays & History Reconciliation', function 
         const discovered = await source.getRecentlyDiscoveredPlays();
         expect(discovered).to.have.lengthOf(2);
     });
+
+    it('5d. Handles 40% listen (80s) + rewind to 0:00 + full listen (280s total) and suppresses both intermediate (80s) and final (280s) Spotify History entries', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(30, 'minutes').startOf('second');
+
+        // 1. Start 200s song at baseTime
+        MockDate.set(baseTime.toDate());
+        await sleep(15);
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({
+                body: makeCurrentlyPlayingPayload({
+                    id: 'track-40pct-rewind',
+                    name: 'Forty Percent Rewind Track',
+                    durationMs: 200_000,
+                    progressMs: 0,
+                    timestampMs: baseTime.valueOf()
+                })
+            }),
+            getMyRecentlyPlayedTracks: sinon.stub(),
+            getTrack: sinon.stub()
+        };
+        await source.getRecentlyPlayed();
+
+        // 2. Listen to 40% (80s) -> does not scrobble yet (< 100s)
+        MockDate.set(baseTime.add(80, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'track-40pct-rewind',
+                name: 'Forty Percent Rewind Track',
+                durationMs: 200_000,
+                progressMs: 80_000,
+                timestampMs: baseTime.add(80, 'seconds').valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // 3. Rewind to beginning (0s) at baseTime + 80s -> closes Range 1 (80s) and opens Range 2 at 0s
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'track-40pct-rewind',
+                name: 'Forty Percent Rewind Track',
+                durationMs: 200_000,
+                progressMs: 0,
+                timestampMs: baseTime.add(80, 'seconds').valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // 4. Listen 20s into rewound song (baseTime + 100s, progress = 20_000ms) -> cumulative 80s + 20s = 100s (50%) -> scrobbles!
+        MockDate.set(baseTime.add(100, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'track-40pct-rewind',
+                name: 'Forty Percent Rewind Track',
+                durationMs: 200_000,
+                progressMs: 20_000,
+                timestampMs: baseTime.add(100, 'seconds').valueOf()
+            })
+        });
+        const emitAt50Pct = await source.getRecentlyPlayed();
+        expect(emitAt50Pct).to.have.lengthOf(1);
+        await source.queuePlay(emitAt50Pct);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        // 5. Continue listening to the end of the rewound song (baseTime + 280s, progress = 200_000ms)
+        MockDate.set(baseTime.add(280, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'track-40pct-rewind',
+                name: 'Forty Percent Rewind Track',
+                durationMs: 200_000,
+                progressMs: 200_000,
+                timestampMs: baseTime.add(280, 'seconds').valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // 6. 15 minutes later, Spotify History Reconcile runs and reports BOTH the 80s rewind entry AND the 280s completion entry
+        MockDate.set(baseTime.add(20, 'minutes').toDate());
+        await sleep(15);
+        const historyItems = [
+            makeHistoryPayload({
+                id: 'track-40pct-rewind',
+                name: 'Forty Percent Rewind Track',
+                durationMs: 200_000,
+                playedAtIso: baseTime.add(80, 'seconds').toISOString()
+            }),
+            makeHistoryPayload({
+                id: 'track-40pct-rewind',
+                name: 'Forty Percent Rewind Track',
+                durationMs: 200_000,
+                playedAtIso: baseTime.add(280, 'seconds').toISOString()
+            })
+        ];
+        (source as any).spotifyApi.getMyRecentlyPlayedTracks.resolves({
+            body: { items: historyItems, total: 2, limit: 50, next: null, cursors: null }
+        });
+
+        await (source as any).processBacklog(new AbortController().signal, 'Reconcile');
+
+        // Both history entries are absorbed by the single live session (still only 1 discovered play!)
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.have.lengthOf(1);
+    });
 });
 

@@ -66,7 +66,7 @@ Track Starts           Threshold Met!                    Position drops to 0:05
    - To qualify as a Replay, an incoming playback update must satisfy:
      1. `hasScrobbled === true` (track already qualified for its first scrobble).
      2. `dropped >= threshold` (position dropped backwards by >= 50% of duration or >= 4 minutes).
-     3. **Start Guard**: `newPosition <= Math.max(30, duration * 0.15)` (the user actually rewound near the beginning of the track, within the first 30 seconds or 15%).
+     3. **Start Guard**: `newPosition <= 30` (the user actually rewound near the beginning of the track, within the first 30 seconds).
    - **Why the Start Guard is critical**: On long tracks (e.g. 10–15 minute songs or podcasts), seeking backward from 8:00 to 3:30 drops 4.5 minutes. Without the start guard, that mid-track scrub would falsely trigger a brand new replay session. The start guard ensures only genuine restarts trigger Play #2.
    - When conditions are met:
      - Recognize as a **Replay**.
@@ -127,11 +127,11 @@ Mark as DUPED.              (< 50% threshold).             SCROBBLE IT FRESH!
 
 1. **Match on the "Completion Window", NOT `pa - duration`**:
    - Spotify History provides completion timestamp `pa` (`playDateCompleted`).
-   - Calculating start time as `pa - duration` fails whenever the listener paused or skipped after 50% (e.g. at 60%), causing timestamp drift of 60–120s and triggering false duplicate scrobbles.
-   - **The Invariant**: A live play that scrobbled at 50% ended somewhere between $(T_{start} + \text{listenedFor})$ and $(T_{start} + \text{duration})$.
+   - Calculating start time as `pa - duration` fails whenever the listener paused, seeked/rewound before 50%, or skipped after 50% (e.g. at 60%), causing timestamp drift of 60–120s and triggering false duplicate scrobbles.
+   - **The Invariant**: A live play that scrobbled at 50% ended somewhere between its earliest valid completion offset (`listenedFor` for single-range plays, or `min(listenedFor, 30s)` for multi-range seeked/rewound plays) and $\max(T_{start} + \text{duration},\; \text{playDateCompleted},\; \text{pauseProjectedEnd})$, where `pauseProjectedEnd` uses positional remaining duration (`duration - lastRange.end.position`) when available.
    - To match a history item against an existing live play, check whether `pa` falls within:
-     $$[\text{playDate} + \text{listenedFor} - 30\text{s}, \;\; \text{playDate} + \text{duration} + 30\text{s}]$$
-   - This naturally accommodates pauses, early skips (50%–99%), and normal completions.
+     $$[\text{playDate} + \text{minCompletionOffset} - 30\text{s}, \;\; \max(\text{playDate} + \text{duration},\; \text{playDateCompleted},\; \text{pauseProjectedEnd}) + 30\text{s}]$$
+   - This naturally accommodates pauses, pre-50% rewinds/loops, early skips (50%–99%), and normal completions.
 
 2. **Persist Skipped Tracks (`state: 'discarded'`) to Prevent Zombie Resurrections**:
    - When the live player detects an explicit skip before 50% (e.g. user skipped after 35s), write the play to the database with `state: 'discarded'`.
@@ -154,7 +154,7 @@ Mark as DUPED.              (< 50% threshold).             SCROBBLE IT FRESH!
   - Manages `hasScrobbled` state.
   - Accumulates `listenRanges` into duration-invariant `listenedFor`.
   - Emits scrobble immediately upon hitting the threshold.
-  - Evaluates `isPositionRewind` with both the threshold drop check AND the start guard (`newPosition <= Math.max(30, duration * 0.15)`).
+  - Evaluates `isPositionRewind` with both the threshold drop check AND the start guard (`newPosition <= 30`).
 * **`MemorySource`**:
   - Discovers candidate plays emitted at 50% immediately without duration locking.
   - When a track transitions without meeting threshold, persists it to the database with `state: 'discarded'`.
@@ -163,7 +163,7 @@ Mark as DUPED.              (< 50% threshold).             SCROBBLE IT FRESH!
   - For backlog queries, checks completion window matching against existing plays across all states (`scrobbled`, `discarded`).
 * **`TimeUtils` & `PlayComparisonUtils`**:
   - Disables fuzzy duration matching for sequential plays.
-  - Matches backlog candidates against live plays using completion-window comparison.
+  - Matches backlog candidates against live plays using completion-window comparison (anchoring `windowStart` at `playDate` on multi-range seeked/rewound plays and using positional remaining duration `duration - lastRange.end.position` for `projectedEnd`).
 * **`SpotifySource`**:
   - Uses `timestamp - progress_ms` for exact live start timestamps.
   - Preserves completion timestamp `pa` for history items.
