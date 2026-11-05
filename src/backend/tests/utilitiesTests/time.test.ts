@@ -1,71 +1,74 @@
 import { expect } from 'chai';
 import { describe, it } from 'mocha';
-import { closeToPlayEnd, closeToPlayStart, repeatDurationPlayed, timePassesScrobbleThreshold } from '../../utils/TimeUtils.ts';
-import { DEFAULT_CLOSE_POSITION_ABSOLUTE, DEFAULT_CLOSE_POSITION_PERCENT, DEFAULT_DURATION_REPEAT_ABSOLUTE, DEFAULT_DURATION_REPEAT_PERCENT, DEFAULT_SCROBBLE_DURATION_THRESHOLD, DEFAULT_SCROBBLE_PERCENT_THRESHOLD } from '../../common/infrastructure/Atomic.ts';
+import dayjs from 'dayjs';
+import { comparePlayTemporally, timePassesScrobbleThreshold } from '../../utils/TimeUtils.ts';
+import { DEFAULT_SCROBBLE_DURATION_THRESHOLD, DEFAULT_SCROBBLE_PERCENT_THRESHOLD } from '../../common/infrastructure/Atomic.ts';
+import { PARSED_FROM, SCROBBLE_TS_SOC_END, SCROBBLE_TS_SOC_START, TA_DURING, TA_EXACT, TA_FUZZY, TA_NONE } from '../../../core/Atomic.ts';
 import { generatePlay } from '../../../core/tests/utils/PlayTestUtils.ts';
 
-describe('Play Position', function() {
+describe('Temporal Play Comparison', function() {
 
-    describe('Close To Start', function() {
+    it('does not fuzzy match consecutive live plays spaced by track duration by default', function() {
+        const start = dayjs();
+        const firstPlay = generatePlay({
+            playDate: start,
+            duration: 180,
+            listenedFor: 90
+        }, {
+            parsedFrom: PARSED_FROM.player,
+            scrobbleTsSOC: SCROBBLE_TS_SOC_START
+        });
+        const secondPlay = generatePlay({
+            playDate: start.add(180, 'seconds'),
+            duration: 180,
+            listenedFor: 90
+        }, {
+            parsedFrom: PARSED_FROM.player,
+            scrobbleTsSOC: SCROBBLE_TS_SOC_START
+        });
 
-        it(`Is close when within ${DEFAULT_CLOSE_POSITION_ABSOLUTE} seconds`, function() {
-            expect(closeToPlayStart(generatePlay(), 10)[0]).is.true; 
-        });
-        it(`Is not close when later than ${DEFAULT_CLOSE_POSITION_ABSOLUTE} seconds`, function() {
-            expect(closeToPlayStart(generatePlay({duration: 60}), 13)[0]).is.false; 
-        });
-        it(`Is close when within ${DEFAULT_CLOSE_POSITION_PERCENT} percent`, function() {
-            expect(closeToPlayStart(generatePlay({duration: 300}), 40)[0]).is.true; 
-        });
-        it(`Is not close when greater than ${DEFAULT_CLOSE_POSITION_PERCENT} percent`, function() {
-            expect(closeToPlayStart(generatePlay({duration: 60}), 15)[0]).is.false; 
-        });
-        it(`Is close when within ${DEFAULT_CLOSE_POSITION_ABSOLUTE} seconds and no duration`, function() {
-            expect(closeToPlayStart(generatePlay({duration: undefined}), 10)[0]).is.true; 
-        });
-
+        const result = comparePlayTemporally(firstPlay, secondPlay);
+        expect(result.match).to.eq(TA_NONE);
     });
 
-    describe('Close To End', function() {
+    it('allows fuzzy duration match only when fuzzyDuration option is explicitly true', function() {
+        const start = dayjs();
+        const firstPlay = generatePlay({
+            playDate: start,
+            duration: 180
+        });
+        const secondPlay = generatePlay({
+            playDate: start.add(180, 'seconds'),
+            duration: 180
+        });
 
-        it(`Is not close when no duration`, function() {
-            expect(closeToPlayEnd(generatePlay({duration: undefined}), 50)[0]).is.false; 
-        });
-        it(`Is close when within ${DEFAULT_CLOSE_POSITION_ABSOLUTE} seconds`, function() {
-            expect(closeToPlayEnd(generatePlay({duration: 60}), 50)[0]).is.true; 
-        });
-        it(`Is not close when earlier than ${DEFAULT_CLOSE_POSITION_ABSOLUTE} seconds`, function() {
-            expect(closeToPlayEnd(generatePlay({duration: 60}), 45)[0]).is.false; 
-        });
-        it(`Is close when within ${DEFAULT_CLOSE_POSITION_PERCENT} percent`, function() {
-            expect(closeToPlayEnd(generatePlay({duration: 300}), 261)[0]).is.true; 
-        });
-        it(`Is not close when less than ${DEFAULT_CLOSE_POSITION_PERCENT} percent`, function() {
-            expect(closeToPlayEnd(generatePlay({duration: 300}), 240)[0]).is.false; 
-        });
-        
+        expect(comparePlayTemporally(firstPlay, secondPlay).match).to.eq(TA_NONE);
+        expect(comparePlayTemporally(firstPlay, secondPlay, { fuzzyDuration: true }).match).to.eq(TA_FUZZY);
     });
 
-});
+    it('matches backlog completion timestamp within live play completion window', function() {
+        const start = dayjs();
+        const livePlay = generatePlay({
+            playDate: start,
+            duration: 200,
+            listenedFor: 100
+        }, {
+            parsedFrom: PARSED_FROM.player,
+            scrobbleTsSOC: SCROBBLE_TS_SOC_START
+        });
+        // User skipped at 60% (120s after start) -> Spotify history reports completion at start + 120s
+        const historyPlay = generatePlay({
+            playDate: start.add(120, 'seconds'),
+            playDateCompleted: start.add(120, 'seconds'),
+            duration: 200
+        }, {
+            parsedFrom: PARSED_FROM.backlog,
+            scrobbleTsSOC: SCROBBLE_TS_SOC_END
+        });
 
-describe('Play Repeat Duration', function() {
-
-    it(`Is valid for repeat when more than ${DEFAULT_DURATION_REPEAT_ABSOLUTE} seconds`, function() {
-        expect(repeatDurationPlayed(generatePlay({duration: 300}), DEFAULT_DURATION_REPEAT_ABSOLUTE + 1)[0]).is.true; 
+        const result = comparePlayTemporally(livePlay, historyPlay);
+        expect(result.match).to.be.oneOf([TA_EXACT, TA_DURING]);
     });
-    it(`Is not valid for repeat when less than ${DEFAULT_DURATION_REPEAT_ABSOLUTE} seconds`, function() {
-        expect(repeatDurationPlayed(generatePlay({duration: 300}), 10)[0]).is.false; 
-    });
-    it(`Is valid for repeat when more than ${DEFAULT_DURATION_REPEAT_PERCENT} percent`, function() {
-        expect(repeatDurationPlayed(generatePlay({duration: 60}), 40)[0]).is.true; 
-    });
-    it(`Is not valid for repeat when less than ${DEFAULT_DURATION_REPEAT_PERCENT} percent`, function() {
-        expect(repeatDurationPlayed(generatePlay({duration: 60}), 15)[0]).is.false; 
-    });
-    it(`Is valid for repeat when more than ${DEFAULT_DURATION_REPEAT_ABSOLUTE} seconds and no duration`, function() {
-        expect(repeatDurationPlayed(generatePlay({duration: undefined}), DEFAULT_DURATION_REPEAT_ABSOLUTE + 1)[0]).is.true; 
-    });
-
 });
 
 describe('Scrobble Threshold Checks', function() {

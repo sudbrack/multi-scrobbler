@@ -1,15 +1,23 @@
-import { describe, it, afterEach } from 'mocha';
+import { describe, it, afterEach, beforeEach } from 'mocha';
 import { loggerTest } from "@foxxmd/logging";
 import { expect } from 'chai';
 import EventEmitter from "events";
 import sinon from 'sinon';
 import clone from 'clone';
+import dayjs from 'dayjs';
+import MockDate from 'mockdate';
+import pEvent from 'p-event';
 import { SimpleIntervalJob } from 'toad-scheduler';
 import SpotifySource from "../../sources/SpotifySource.ts";
 import { envSchemas, type SpotifySourceConfig } from "../../common/infrastructure/config/source/spotify.ts";
 import currentlyPlayingNoIsrcPayload from '../plays/spotifyCurrentlyPlayingNoIsrc.json' with { type: "json" };
 import playbackState from '../plays/spotifyCurrentPlaybackState.json' with { type: "json" };
 import { creditIsrc } from '../../../core/MusicMetadata.ts';
+import { RT_TICK_DEFAULT, setRtTick } from '../../sources/PlayerState/RealtimePlayer.ts';
+import { SCROBBLE_TS_SOC_START } from '../../../core/Atomic.ts';
+import { WildcardEmitter } from '../../common/WildcardEmitter.ts';
+import type { MSBackendEventMap } from '../../common/infrastructure/MSBackendEventMap.ts';
+import { sleep } from '../../utils.ts';
 
 const createSpotifySource = (options: SpotifySourceConfig['options'] = {}): SpotifySource => {
     const config = {
@@ -205,6 +213,806 @@ describe('Spotify - Configuration', function () {
         });
 
         expect(parsed.options?.scrobbleBacklog).to.be.false;
+    });
+});
+
+class TestableSpotifySource extends SpotifySource {
+    protected async doBuildInitData(): Promise<true | string | undefined> {
+        return true;
+    }
+    protected async doCheckConnection(): Promise<true | string | undefined> {
+        return true;
+    }
+    doAuthentication = async () => {
+        return true;
+    }
+}
+
+const createInitializedSpotifySource = async (options: SpotifySourceConfig['options'] = {}) => {
+    const emitter = new WildcardEmitter<MSBackendEventMap>();
+    const config = {
+        id: `test-spotify-${Date.now()}-${Math.random()}`,
+        data: {
+            clientId: 'test-client',
+            clientSecret: 'test-secret',
+        },
+        options
+    } as unknown as SpotifySourceConfig;
+    const source = new TestableSpotifySource('spotify-test', config, { localUrl: new URL('http://test'), configDir: 'test', logger: loggerTest, version: 'test' }, emitter);
+    source.queueIdleMs = 2;
+    source.queueConcurrency = 1;
+    source.stopPollingWaitInterval = 10;
+    await source.initialize();
+    source.scheduler.stop();
+    await source.startDiscoveryQueue();
+    return source;
+};
+
+const makeCurrentlyPlayingPayload = (opts: {
+    id: string;
+    name: string;
+    artistName?: string;
+    durationMs: number;
+    progressMs: number;
+    timestampMs: number;
+    isPlaying?: boolean;
+}): SpotifyApi.CurrentlyPlayingObject => {
+    const payload = clone(playbackState) as unknown as SpotifyApi.CurrentlyPlayingObject;
+    payload.timestamp = opts.timestampMs;
+    payload.progress_ms = opts.progressMs;
+    payload.is_playing = opts.isPlaying ?? true;
+    const item = payload.item as SpotifyApi.TrackObjectFull;
+    item.id = opts.id;
+    item.name = opts.name;
+    item.duration_ms = opts.durationMs;
+    if (item.external_ids !== undefined) {
+        item.external_ids.isrc = `ISRC-${opts.id}`;
+    }
+    if (opts.artistName !== undefined) {
+        item.artists = [{ ...item.artists[0], id: `artist-${opts.id}`, name: opts.artistName }];
+        item.album.artists = item.artists;
+    }
+    return payload;
+};
+
+const makeHistoryPayload = (opts: {
+    id: string;
+    name: string;
+    artistName?: string;
+    durationMs: number;
+    playedAtIso: string;
+}): SpotifyApi.PlayHistoryObject => {
+    const base = clone(playbackState.item) as unknown as SpotifyApi.TrackObjectFull;
+    base.id = opts.id;
+    base.name = opts.name;
+    base.duration_ms = opts.durationMs;
+    if (base.external_ids !== undefined) {
+        base.external_ids.isrc = `ISRC-${opts.id}`;
+    }
+    if (opts.artistName !== undefined) {
+        base.artists = [{ ...base.artists[0], id: `artist-${opts.id}`, name: opts.artistName }];
+        base.album.artists = base.artists;
+    }
+    return {
+        track: base,
+        played_at: opts.playedAtIso,
+        context: null as any
+    };
+};
+
+describe('Spotify - 50% Scrobbling, Replays & History Reconciliation', function () {
+
+    beforeEach(function () {
+        setRtTick(1);
+    });
+
+    afterEach(function () {
+        MockDate.reset();
+        setRtTick(RT_TICK_DEFAULT);
+        sinon.restore();
+    });
+
+    it('1. Derives exact start timestamp (timestamp - progress_ms) and emits scrobble immediately at 50%', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(10, 'minutes').startOf('second');
+
+        // Track started at baseTime, snapshot taken 10s into track (progress_ms = 10_000)
+        MockDate.set(baseTime.add(10, 'seconds').toDate());
+        await sleep(15);
+        const poll1 = makeCurrentlyPlayingPayload({
+            id: 'track-50pct',
+            name: 'Fifty Percent Song',
+            durationMs: 200_000,
+            progressMs: 10_000,
+            timestampMs: baseTime.add(10, 'seconds').valueOf()
+        });
+        const formatted = SpotifySource.formatPlayObj(poll1);
+        expect(formatted.data.playDate?.unix()).to.equal(baseTime.unix());
+        expect(formatted.meta.scrobbleTsSOC).to.equal(SCROBBLE_TS_SOC_START);
+
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({ body: poll1 }),
+            getTrack: sinon.stub()
+        };
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Advance to 60s (50s listened < 100s threshold) -> no scrobble yet
+        MockDate.set(baseTime.add(60, 'seconds').toDate());
+        await sleep(15);
+        const poll2 = makeCurrentlyPlayingPayload({
+            id: 'track-50pct',
+            name: 'Fifty Percent Song',
+            durationMs: 200_000,
+            progressMs: 60_000,
+            timestampMs: baseTime.add(60, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: poll2 });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Advance to 115s (105s listened >= 100s 50% threshold) -> emits scrobble immediately mid-track!
+        MockDate.set(baseTime.add(115, 'seconds').toDate());
+        await sleep(15);
+        const poll3 = makeCurrentlyPlayingPayload({
+            id: 'track-50pct',
+            name: 'Fifty Percent Song',
+            durationMs: 200_000,
+            progressMs: 115_000,
+            timestampMs: baseTime.add(115, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: poll3 });
+        const emittedAt50 = await source.getRecentlyPlayed();
+        expect(emittedAt50).to.have.lengthOf(1);
+        expect(emittedAt50[0].data.playDate?.unix()).to.equal(baseTime.unix());
+        expect(emittedAt50[0].meta.scrobbleTsSOC).to.equal(SCROBBLE_TS_SOC_START);
+
+        // Continue playing to 190s -> does NOT double-emit
+        MockDate.set(baseTime.add(190, 'seconds').toDate());
+        await sleep(15);
+        const poll4 = makeCurrentlyPlayingPayload({
+            id: 'track-50pct',
+            name: 'Fifty Percent Song',
+            durationMs: 200_000,
+            progressMs: 190_000,
+            timestampMs: baseTime.add(190, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: poll4 });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+    });
+
+    it('2 & 4. Handles post-50% rewind to start as a second scrobble without false duplicate flagging', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(15, 'minutes').startOf('second');
+
+        // Start Play #1 at 0s (duration = 180s, threshold = 90s)
+        MockDate.set(baseTime.toDate());
+        await sleep(15);
+        const p1Start = makeCurrentlyPlayingPayload({
+            id: 'track-replay',
+            name: 'Replayable Banger',
+            durationMs: 180_000,
+            progressMs: 0,
+            timestampMs: baseTime.valueOf()
+        });
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({ body: p1Start }),
+            getTrack: sinon.stub()
+        };
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Play #1 hits 100s (> 50%) -> emits Play #1
+        MockDate.set(baseTime.add(100, 'seconds').toDate());
+        await sleep(15);
+        const p1Mid = makeCurrentlyPlayingPayload({
+            id: 'track-replay',
+            name: 'Replayable Banger',
+            durationMs: 180_000,
+            progressMs: 100_000,
+            timestampMs: baseTime.add(100, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: p1Mid });
+        const firstEmit = await source.getRecentlyPlayed();
+        expect(firstEmit).to.have.lengthOf(1);
+        await source.queuePlay(firstEmit);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        // Play #1 continues to 160s, then user rewinds to 5s (dropped 155s >= 90s, 5s <= 30s start guard)
+        MockDate.set(baseTime.add(160, 'seconds').toDate());
+        await sleep(15);
+        const p1NearEnd = makeCurrentlyPlayingPayload({
+            id: 'track-replay',
+            name: 'Replayable Banger',
+            durationMs: 180_000,
+            progressMs: 160_000,
+            timestampMs: baseTime.add(160, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: p1NearEnd });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        const rewindTime = baseTime.add(165, 'seconds');
+        MockDate.set(rewindTime.toDate());
+        await sleep(15);
+        const p2Rewind = makeCurrentlyPlayingPayload({
+            id: 'track-replay',
+            name: 'Replayable Banger',
+            durationMs: 180_000,
+            progressMs: 5_000,
+            timestampMs: rewindTime.valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: p2Rewind });
+        // Rewind resets session for Play #2; Play #1 was already emitted at 50% so nothing emitted at rewind instant
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Play #2 progresses from 5s to 100s (95s listened >= 90s threshold) -> emits Play #2!
+        const p2MidTime = rewindTime.add(95, 'seconds');
+        MockDate.set(p2MidTime.toDate());
+        await sleep(15);
+        const p2Mid = makeCurrentlyPlayingPayload({
+            id: 'track-replay',
+            name: 'Replayable Banger',
+            durationMs: 180_000,
+            progressMs: 100_000,
+            timestampMs: p2MidTime.valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: p2Mid });
+        const secondEmit = await source.getRecentlyPlayed();
+        expect(secondEmit).to.have.lengthOf(1);
+        expect(secondEmit[0].data.repeat).to.be.true;
+
+        await source.queuePlay(secondEmit);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.have.lengthOf(2);
+    });
+
+    it('5. Does not duplicate scrobble when history reconcile runs after early skip (60%) or pause', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(20, 'minutes').startOf('second');
+
+        // Start track at baseTime (duration = 200s, threshold = 100s)
+        MockDate.set(baseTime.toDate());
+        await sleep(15);
+        const pStart = makeCurrentlyPlayingPayload({
+            id: 'track-early-skip',
+            name: 'Paused Or Skipped Track',
+            durationMs: 200_000,
+            progressMs: 0,
+            timestampMs: baseTime.valueOf()
+        });
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({ body: pStart }),
+            getMyRecentlyPlayedTracks: sinon.stub(),
+            getTrack: sinon.stub()
+        };
+        await source.getRecentlyPlayed();
+
+        // Crosses 50% at 110s -> scrobbled live
+        MockDate.set(baseTime.add(110, 'seconds').toDate());
+        await sleep(15);
+        const pMid = makeCurrentlyPlayingPayload({
+            id: 'track-early-skip',
+            name: 'Paused Or Skipped Track',
+            durationMs: 200_000,
+            progressMs: 110_000,
+            timestampMs: baseTime.add(110, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: pMid });
+        const liveEmitted = await source.getRecentlyPlayed();
+        expect(liveEmitted).to.have.lengthOf(1);
+        await source.queuePlay(liveEmitted);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        // User skips at 60% (120s after baseTime). Spotify history logs played_at = baseTime + 120s.
+        // 15 minutes later, reconcile job runs.
+        MockDate.set(baseTime.add(15, 'minutes').toDate());
+        await sleep(15);
+        const historyItem = makeHistoryPayload({
+            id: 'track-early-skip',
+            name: 'Paused Or Skipped Track',
+            durationMs: 200_000,
+            playedAtIso: baseTime.add(120, 'seconds').toISOString()
+        });
+        (source as any).spotifyApi.getMyRecentlyPlayedTracks.resolves({
+            body: { items: [historyItem], total: 1, limit: 50, next: null, cursors: null }
+        });
+
+        await (source as any).processBacklog(new AbortController().signal, 'Reconcile');
+        // Since findPreQueueExistingPlay matches the completion window, nothing new is discovered
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.have.lengthOf(1);
+    });
+
+    it('5b. Does not duplicate scrobble when user pauses for 2 minutes mid-track and finishes later', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(25, 'minutes').startOf('second');
+
+        // Start track at baseTime (duration = 200s, threshold = 100s)
+        MockDate.set(baseTime.toDate());
+        await sleep(15);
+        const pStart = makeCurrentlyPlayingPayload({
+            id: 'track-paused-2min',
+            name: 'Paused For Two Minutes',
+            durationMs: 200_000,
+            progressMs: 0,
+            timestampMs: baseTime.valueOf()
+        });
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({ body: pStart }),
+            getMyRecentlyPlayedTracks: sinon.stub(),
+            getTrack: sinon.stub()
+        };
+        await source.getRecentlyPlayed();
+
+        // Crosses 50% at 110s -> scrobbled live
+        MockDate.set(baseTime.add(110, 'seconds').toDate());
+        await sleep(15);
+        const pMid = makeCurrentlyPlayingPayload({
+            id: 'track-paused-2min',
+            name: 'Paused For Two Minutes',
+            durationMs: 200_000,
+            progressMs: 110_000,
+            timestampMs: baseTime.add(110, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: pMid });
+        const liveEmitted = await source.getRecentlyPlayed();
+        expect(liveEmitted).to.have.lengthOf(1);
+        await source.queuePlay(liveEmitted);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        // User pauses at 110s for 120s (2 minutes), then resumes at T + 230s and finishes at T + 320s
+        MockDate.set(baseTime.add(230, 'seconds').toDate());
+        await sleep(15);
+        const pResumed = makeCurrentlyPlayingPayload({
+            id: 'track-paused-2min',
+            name: 'Paused For Two Minutes',
+            durationMs: 200_000,
+            progressMs: 110_000,
+            timestampMs: baseTime.add(230, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: pResumed });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        MockDate.set(baseTime.add(320, 'seconds').toDate());
+        await sleep(15);
+        const pNext = makeCurrentlyPlayingPayload({
+            id: 'track-after-pause',
+            name: 'Next Track After Pause',
+            artistName: 'Another Artist',
+            durationMs: 180_000,
+            progressMs: 0,
+            timestampMs: baseTime.add(320, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: pNext });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // 15 minutes later, Spotify History reports completion at baseTime + 320s (120s past playDate + duration!)
+        MockDate.set(baseTime.add(20, 'minutes').toDate());
+        await sleep(15);
+        const historyItem = makeHistoryPayload({
+            id: 'track-paused-2min',
+            name: 'Paused For Two Minutes',
+            durationMs: 200_000,
+            playedAtIso: baseTime.add(320, 'seconds').toISOString()
+        });
+        (source as any).spotifyApi.getMyRecentlyPlayedTracks.resolves({
+            body: { items: [historyItem], total: 1, limit: 50, next: null, cursors: null }
+        });
+
+        await (source as any).processBacklog(new AbortController().signal, 'Reconcile');
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.have.lengthOf(1);
+    });
+
+    it('4b. Handles rapid track switches (A -> B -> A) by discarding sub-50% Song B and scrobbling both A sessions', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(20, 'minutes').startOf('second');
+
+        // Song A plays to 100s (duration = 180s, threshold = 90s) -> scrobbles Play #1 of Song A
+        MockDate.set(baseTime.toDate());
+        await sleep(15);
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({
+                body: makeCurrentlyPlayingPayload({
+                    id: 'song-a',
+                    name: 'Song A',
+                    durationMs: 180_000,
+                    progressMs: 0,
+                    timestampMs: baseTime.valueOf()
+                })
+            }),
+            getTrack: sinon.stub()
+        };
+        await source.getRecentlyPlayed();
+
+        MockDate.set(baseTime.add(100, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-a',
+                name: 'Song A',
+                durationMs: 180_000,
+                progressMs: 100_000,
+                timestampMs: baseTime.add(100, 'seconds').valueOf()
+            })
+        });
+        const emitA1 = await source.getRecentlyPlayed();
+        expect(emitA1).to.have.lengthOf(1);
+        await source.queuePlay(emitA1);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        // User skips to Song B for 8 seconds, then clicks back to Song A
+        MockDate.set(baseTime.add(110, 'seconds').toDate());
+        await sleep(10);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-b',
+                name: 'Song B',
+                artistName: 'Artist B',
+                durationMs: 200_000,
+                progressMs: 0,
+                timestampMs: baseTime.add(110, 'seconds').valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        MockDate.set(baseTime.add(118, 'seconds').toDate());
+        await sleep(10);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-b',
+                name: 'Song B',
+                artistName: 'Artist B',
+                durationMs: 200_000,
+                progressMs: 8_000,
+                timestampMs: baseTime.add(118, 'seconds').valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Switch back to Song A at T + 120s
+        const a2Start = baseTime.add(120, 'seconds');
+        MockDate.set(a2Start.toDate());
+        await sleep(10);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-a',
+                name: 'Song A',
+                durationMs: 180_000,
+                progressMs: 0,
+                timestampMs: a2Start.valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Song B should be recorded as discarded
+        const discarded = await source.playRepo.findPlays({ state: ['discarded'] });
+        expect(discarded).to.have.lengthOf(1);
+        expect(discarded[0].play.data.track?.name).to.equal('Song B');
+
+        // Song A plays to 100s in its new session -> scrobbles Play #2 of Song A!
+        MockDate.set(a2Start.add(100, 'seconds').toDate());
+        await sleep(10);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-a',
+                name: 'Song A',
+                durationMs: 180_000,
+                progressMs: 100_000,
+                timestampMs: a2Start.add(100, 'seconds').valueOf()
+            })
+        });
+        const emitA2 = await source.getRecentlyPlayed();
+        expect(emitA2).to.have.lengthOf(1);
+        await source.queuePlay(emitA2);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.have.lengthOf(2);
+    });
+
+    it('6. Persists sub-50% skip (35s) as state="discarded" and does NOT resurrect it during history reconcile', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(20, 'minutes').startOf('second');
+
+        // Track A starts at 0s (duration = 200s, threshold = 100s)
+        MockDate.set(baseTime.toDate());
+        await sleep(15);
+        const trackAStart = makeCurrentlyPlayingPayload({
+            id: 'track-skipped-35s',
+            name: 'Thirty Five Second Skip',
+            durationMs: 200_000,
+            progressMs: 0,
+            timestampMs: baseTime.valueOf()
+        });
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({ body: trackAStart }),
+            getMyRecentlyPlayedTracks: sinon.stub(),
+            getTrack: sinon.stub()
+        };
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Track A plays to 35s
+        MockDate.set(baseTime.add(35, 'seconds').toDate());
+        await sleep(15);
+        const trackA35s = makeCurrentlyPlayingPayload({
+            id: 'track-skipped-35s',
+            name: 'Thirty Five Second Skip',
+            durationMs: 200_000,
+            progressMs: 35_000,
+            timestampMs: baseTime.add(35, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: trackA35s });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // User skips to Track B at 36s -> Track A is evaluated (< 50%) and persisted as state: 'discarded'
+        MockDate.set(baseTime.add(36, 'seconds').toDate());
+        await sleep(15);
+        const trackBStart = makeCurrentlyPlayingPayload({
+            id: 'track-b-next',
+            name: 'Next Song',
+            artistName: 'Other Artist',
+            durationMs: 180_000,
+            progressMs: 0,
+            timestampMs: baseTime.add(36, 'seconds').valueOf()
+        });
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({ body: trackBStart });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        const discardedInDb = await source.playRepo.findPlays({ state: ['discarded'] });
+        expect(discardedInDb).to.have.lengthOf(1);
+        expect(discardedInDb[0].play.data.track?.name).to.equal('Thirty Five Second Skip');
+
+        // 15 minutes later, Spotify History returns the 35s track (since Spotify logs >=30s listens)
+        MockDate.set(baseTime.add(15, 'minutes').toDate());
+        await sleep(15);
+        const historyItem = makeHistoryPayload({
+            id: 'track-skipped-35s',
+            name: 'Thirty Five Second Skip',
+            durationMs: 200_000,
+            playedAtIso: baseTime.add(36, 'seconds').toISOString()
+        });
+        (source as any).spotifyApi.getMyRecentlyPlayedTracks.resolves({
+            body: { items: [historyItem], total: 1, limit: 50, next: null, cursors: null }
+        });
+
+        await (source as any).processBacklog(new AbortController().signal, 'Reconcile');
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.be.empty;
+    });
+
+    it('7. Recovers 3 missed plays from Spotify History after a live API blackout while ignoring in-flight (< 2 min) plays', async function () {
+        await using source = await createInitializedSpotifySource();
+        const now = dayjs().startOf('second');
+        MockDate.set(now.toDate());
+        await sleep(15);
+
+        // 3 tracks played 10, 7, and 4 minutes ago during a Spotify live API blackout; plus 1 in-flight track 30s ago
+        const historyItems = [
+            makeHistoryPayload({
+                id: 'missed-1',
+                name: 'Missed Track One',
+                artistName: 'Band Alpha',
+                durationMs: 180_000,
+                playedAtIso: now.subtract(10, 'minutes').toISOString()
+            }),
+            makeHistoryPayload({
+                id: 'missed-2',
+                name: 'Missed Track Two',
+                artistName: 'Band Beta',
+                durationMs: 180_000,
+                playedAtIso: now.subtract(7, 'minutes').toISOString()
+            }),
+            makeHistoryPayload({
+                id: 'missed-3',
+                name: 'Missed Track Three',
+                artistName: 'Band Gamma',
+                durationMs: 180_000,
+                playedAtIso: now.subtract(4, 'minutes').toISOString()
+            }),
+            makeHistoryPayload({
+                id: 'inflight-4',
+                name: 'In Flight Track Four',
+                artistName: 'Band Delta',
+                durationMs: 180_000,
+                playedAtIso: now.subtract(30, 'seconds').toISOString()
+            })
+        ];
+
+        (source as any).spotifyApi = {
+            getMyRecentlyPlayedTracks: sinon.stub().resolves({
+                body: { items: historyItems, total: historyItems.length, limit: 50, next: null, cursors: null }
+            })
+        };
+
+        await (source as any).processBacklog(new AbortController().signal, 'Reconcile');
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.have.lengthOf(3);
+        expect(discovered.map(x => x.data.track?.name)).to.deep.equal([
+            'Missed Track One',
+            'Missed Track Two',
+            'Missed Track Three'
+        ]);
+    });
+
+    it('4c. Handles rapid sub-10s track switches (A 4s skip -> B 3s skip -> A full listen) without colliding with discarded A', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(20, 'minutes').startOf('second');
+
+        // Start Song A at T_0, listen for 4s (< 50%)
+        MockDate.set(baseTime.toDate());
+        await sleep(15);
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({
+                body: makeCurrentlyPlayingPayload({
+                    id: 'song-a-rapid',
+                    name: 'Song A Rapid',
+                    durationMs: 180_000,
+                    progressMs: 0,
+                    timestampMs: baseTime.valueOf()
+                })
+            }),
+            getTrack: sinon.stub()
+        };
+        await source.getRecentlyPlayed();
+
+        MockDate.set(baseTime.add(4, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-a-rapid',
+                name: 'Song A Rapid',
+                durationMs: 180_000,
+                progressMs: 4_000,
+                timestampMs: baseTime.add(4, 'seconds').valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Switch to Song B at T_0 + 4s for 3s -> Song A #1 is persisted as state: 'discarded'
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-b-rapid',
+                name: 'Song B Rapid',
+                artistName: 'Artist B',
+                durationMs: 200_000,
+                progressMs: 0,
+                timestampMs: baseTime.add(4, 'seconds').valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        MockDate.set(baseTime.add(7, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-b-rapid',
+                name: 'Song B Rapid',
+                artistName: 'Artist B',
+                durationMs: 200_000,
+                progressMs: 3_000,
+                timestampMs: baseTime.add(7, 'seconds').valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Switch back to Song A at T_0 + 7s (only 7s after Song A #1's start timestamp!)
+        const a2Start = baseTime.add(7, 'seconds');
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-a-rapid',
+                name: 'Song A Rapid',
+                durationMs: 180_000,
+                progressMs: 0,
+                timestampMs: a2Start.valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Both sub-50% skips (A #1 and B #1) are persisted as discarded
+        const discarded = await source.playRepo.findPlays({ state: ['discarded'] });
+        expect(discarded).to.have.lengthOf(2);
+
+        // Song A #2 plays past 50% (100s) -> must NOT collide with discarded Song A #1!
+        MockDate.set(a2Start.add(100, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'song-a-rapid',
+                name: 'Song A Rapid',
+                durationMs: 180_000,
+                progressMs: 100_000,
+                timestampMs: a2Start.add(100, 'seconds').valueOf()
+            })
+        });
+        const emitA2 = await source.getRecentlyPlayed();
+        expect(emitA2).to.have.lengthOf(1);
+        await source.queuePlay(emitA2);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.have.lengthOf(1);
+        expect(discovered[0].data.track?.name).to.equal('Song A Rapid');
+    });
+
+    it('5c. Preserves hasScrobbled across stale pause (> 3m) so unpausing + rewinding to 0:05 scrobbles Play #2 and finishing updates playDateCompleted', async function () {
+        await using source = await createInitializedSpotifySource();
+        const baseTime = dayjs().subtract(30, 'minutes').startOf('second');
+
+        // Start 200s track at baseTime, scrobble at 110s
+        MockDate.set(baseTime.toDate());
+        await sleep(15);
+        (source as any).spotifyApi = {
+            getMyCurrentPlayingTrack: sinon.stub().resolves({
+                body: makeCurrentlyPlayingPayload({
+                    id: 'stale-pause-track',
+                    name: 'Stale Pause Track',
+                    durationMs: 200_000,
+                    progressMs: 0,
+                    timestampMs: baseTime.valueOf()
+                })
+            }),
+            getMyRecentlyPlayedTracks: sinon.stub(),
+            getTrack: sinon.stub()
+        };
+        await source.getRecentlyPlayed();
+
+        MockDate.set(baseTime.add(110, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'stale-pause-track',
+                name: 'Stale Pause Track',
+                durationMs: 200_000,
+                progressMs: 110_000,
+                timestampMs: baseTime.add(110, 'seconds').valueOf()
+            })
+        });
+        const emit1 = await source.getRecentlyPlayed();
+        expect(emit1).to.have.lengthOf(1);
+        await source.queuePlay(emit1);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        // Simulate stale pause (> 3 minutes with no fresh state) -> triggers cleanupPlayer
+        MockDate.set(baseTime.add(350, 'seconds').toDate());
+        await sleep(15);
+        expect(await source.processRecentPlays([])).to.be.empty;
+
+        // User unpauses at baseTime + 360s and rewinds to 0:05 (5_000ms) -> triggers Play #2!
+        const rewindTime = baseTime.add(360, 'seconds');
+        MockDate.set(rewindTime.toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'stale-pause-track',
+                name: 'Stale Pause Track',
+                durationMs: 200_000,
+                progressMs: 5_000,
+                timestampMs: rewindTime.valueOf()
+            })
+        });
+        expect(await source.getRecentlyPlayed()).to.be.empty;
+
+        // Play #2 reaches 110s -> scrobbles Play #2!
+        MockDate.set(rewindTime.add(105, 'seconds').toDate());
+        await sleep(15);
+        (source as any).spotifyApi.getMyCurrentPlayingTrack.resolves({
+            body: makeCurrentlyPlayingPayload({
+                id: 'stale-pause-track',
+                name: 'Stale Pause Track',
+                durationMs: 200_000,
+                progressMs: 110_000,
+                timestampMs: rewindTime.add(105, 'seconds').valueOf()
+            })
+        });
+        const emit2 = await source.getRecentlyPlayed();
+        expect(emit2).to.have.lengthOf(1);
+        await source.queuePlay(emit2);
+        await Promise.race([pEvent(source.emitter, 'queueEmptied'), pEvent(source.emitter, 'discoveryQueueError')]);
+
+        const discovered = await source.getRecentlyDiscoveredPlays();
+        expect(discovered).to.have.lengthOf(2);
     });
 });
 

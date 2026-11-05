@@ -177,7 +177,9 @@ export default class SpotifySource extends MemoryPositionalSource implements Pag
             }
 
             scrobbleTsSOC = SCROBBLE_TS_SOC_START;
-            played_at = dayjs(timestamp);
+            played_at = progress_ms !== null && progress_ms !== undefined
+                ? dayjs(timestamp).subtract(progress_ms, 'ms')
+                : dayjs(timestamp);
             artists = art;
             name = n;
             id = i;
@@ -395,12 +397,7 @@ export default class SpotifySource extends MemoryPositionalSource implements Pag
             }
         }
         const newPlays = await this.processRecentPlays(plays);
-        // hint that scrobble timestamp source of truth should be when the track ended (player changed tracks)
-        // rather than when we first saw the track
-        //
-        // this is because Spotify play history (getMyRecentlyPlayedTracks) timestamps based on end of play
-        // and when we backlog we want timestamps to be as accurate as possible
-        return newPlays.map(x => ({...x, meta: {...x.meta, scrobbleTsSOC: SCROBBLE_TS_SOC_END}}))
+        return newPlays;
     }
 
     getPaginatedUnitOfTime(): dayjs.ManipulateType {
@@ -694,7 +691,14 @@ export default class SpotifySource extends MemoryPositionalSource implements Pag
         }
     }
 
-    protected getBackloggedPlays = async (options: RecentlyPlayedOptions = {}) => await this.getPlayHistory({formatted: true, ...options})
+    protected getBackloggedPlays = async (options: RecentlyPlayedOptions = {}) => {
+        const plays = await this.getPlayHistory({formatted: true, ...options});
+        const cutoff = dayjs().subtract(2, 'minutes');
+        return plays.filter(x => {
+            const ts = x.data.playDateCompleted ?? x.data.playDate;
+            return ts === undefined || ts.isBefore(cutoff);
+        });
+    }
 }
 
 const asPlayHistoryObject = (obj: object): obj is SpotifyApi.PlayHistoryObject => 'played_at' in obj

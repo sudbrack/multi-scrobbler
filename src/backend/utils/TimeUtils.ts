@@ -3,6 +3,7 @@ import dayjs, { type Dayjs } from "dayjs";
 //import isToday from 'dayjs/plugin/isToday.js';
 import {
     type AcceptableTemporalDuringReference,
+    PARSED_FROM,
     type PlayObject,
     SCROBBLE_TS_SOC_END,
     SCROBBLE_TS_SOC_START,
@@ -19,10 +20,6 @@ import {
 } from "../../core/Atomic.ts";
 import { capitalize, stringIsOnlyNumbers } from "../../core/StringUtils.ts";
 import {
-    DEFAULT_CLOSE_POSITION_ABSOLUTE,
-    DEFAULT_CLOSE_POSITION_PERCENT,
-    DEFAULT_DURATION_REPEAT_ABSOLUTE,
-    DEFAULT_DURATION_REPEAT_PERCENT,
     DEFAULT_SCROBBLE_DURATION_THRESHOLD,
     DEFAULT_SCROBBLE_PERCENT_THRESHOLD,
     type DurationValue,
@@ -97,28 +94,34 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
         }
     } = existingPlay;
 
-    const [existingTsSOCDate, existingTsSOC] = getScrobbleTsSOCDateWithContext(existingPlay);
+    const [existingTsSOCDate] = getScrobbleTsSOCDateWithContext(existingPlay);
 
     const {
-        // meta: {
-        //   scrobbleTsSOC: candidateScrobbleTsSOC = SCROBBLE_TS_SOC_START,
-        // },
         data: {
-            // playDate: newPlayDate,
-            // playDateCompleted: candidatePlayDateCompleted,
             duration: newDuration,
-            listenRanges: newRanges,
             listenedFor: newListenedFor,
         }
     } = candidatePlay;
 
-    const [candidateTsSOCDate, candidateTsSOC] = getScrobbleTsSOCDateWithContext(candidatePlay);
+    const [candidateTsSOCDate] = getScrobbleTsSOCDateWithContext(candidatePlay);
+
+    const candidateIsLive = candidatePlay.meta.parsedFrom === PARSED_FROM.player
+        || candidatePlay.meta.newFromSource === true
+        || (candidatePlay.data.listenRanges !== undefined && candidatePlay.data.listenRanges.length > 0);
+    const existingIsLive = existingPlay.meta.parsedFrom === PARSED_FROM.player
+        || existingPlay.meta.newFromSource === true
+        || (existingPlay.data.listenRanges !== undefined && existingPlay.data.listenRanges.length > 0);
+    const candidateIsBacklogOrHistory = !candidateIsLive && (
+        candidatePlay.meta.parsedFrom === PARSED_FROM.backlog
+        || candidatePlay.meta.parsedFrom === PARSED_FROM.history
+        || candidatePlay.meta.scrobbleTsSOC === SCROBBLE_TS_SOC_END
+    );
 
     const {
         diffThreshold = getTemporalAccuracyCloseVal(source as SourceType),
         fuzzyDuration = false,
         fuzzyDiffThreshold = 10,
-        duringReferences = ['range'],
+        duringReferences = candidateIsLive ? [] : (candidateIsBacklogOrHistory ? ['range', 'listenedFor', 'duration'] : ['range']),
         logger = loggerNoop
     } = options;
 
@@ -127,8 +130,15 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
         duringReferences
     };
 
+    const existingCompareDate = (candidateIsLive && existingIsLive && existingPlay.data.playDate !== undefined)
+        ? existingPlay.data.playDate
+        : existingTsSOCDate;
+    const candidateCompareDate = (candidateIsLive && existingIsLive && candidatePlay.data.playDate !== undefined)
+        ? candidatePlay.data.playDate
+        : candidateTsSOCDate;
+
     // cant compare!
-    if (existingTsSOCDate === undefined || candidateTsSOCDate === undefined) {
+    if (existingCompareDate === undefined || candidateCompareDate === undefined) {
         return result;
     }
 
@@ -138,7 +148,7 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
     const playDiffThreshold = diffThreshold;
 
     // check if existing play time is same as new play date
-    const scrobblePlayDiff = Math.abs(existingTsSOCDate.unix() - candidateTsSOCDate.unix());
+    const scrobblePlayDiff = Math.abs(existingCompareDate.unix() - candidateCompareDate.unix());
     result.date = {
         threshold: diffThreshold,
         diff: scrobblePlayDiff,
@@ -156,80 +166,79 @@ export const comparePlayTemporally = (existingPlay: PlayObject, candidatePlay: P
     }
 
     if(duringReferences.length > 0) {
+        // NOTE: completion window anchors on existingPlay.data.playDate directly,
+        // NOT existingTsSOCDate -- existingTsSOCDate can resolve to playDateCompleted instead of
+        // playDate depending on the play's scrobbleTsSOC.
+        // Completion window: [playDate + listenedFor - 30s, max(playDate + duration, playDateCompleted, pauseProjectedEnd) + 30s]
+        const existingPlayDate = existingPlay.data.playDate;
+        if (
+            existingPlayDate !== undefined
+            && (duringReferences.includes('duration') || duringReferences.includes('listenedFor'))
+            && (existingPlay.data.duration !== undefined || existingPlay.data.listenedFor !== undefined)
+        ) {
+            const listenedOffset = existingPlay.data.listenedFor ?? 0;
+            const windowStart = existingPlayDate.add(listenedOffset, 's').subtract(30, 's');
 
-        // guard against old, badly cached/marshalled range data:
-        // this should not be an issue in 0.14.0+ since listenprogress has been updated to be a plain object
-        // but for folks migrating with very old cached data it could end up being an issue
-        try {
-            if (duringReferences.includes('range') && existingRanges !== undefined) {
-                // since we know when the existing track was listened to
-                // we can check if the new track play date took place while the existing one was being listened to
-                // which would indicate (assuming same source) the new track is a duplicate
-                for (const range of existingRanges) {
-
-                    if (candidateTsSOCDate.isBetween(range.start.timestamp, range.end.timestamp)) {
-                        result.range = {
-                            type: 'range',
-                            timestamps: [range.start.timestamp, range.end.timestamp]
-                        }
-                        result.match = TA_DURING;
-                        return result;
+            let baseEnd = existingPlayDate.add(Math.max(existingPlay.data.duration ?? 0, listenedOffset), 's');
+            if (existingPlay.data.playDateCompleted !== undefined && existingPlay.data.playDateCompleted.isAfter(baseEnd)) {
+                baseEnd = existingPlay.data.playDateCompleted;
+            }
+            try {
+                if (existingRanges !== undefined && existingRanges.length > 0) {
+                    const lastRangeEnd = existingRanges[existingRanges.length - 1].end.timestamp;
+                    const remainingDuration = Math.max(0, (existingPlay.data.duration ?? 0) - listenedOffset);
+                    const projectedEnd = lastRangeEnd.add(remainingDuration, 's');
+                    if (projectedEnd.isAfter(baseEnd)) {
+                        baseEnd = projectedEnd;
                     }
                 }
+            } catch (e) {
+                logger.warn(new Error('Failed to compute projected range end', {cause: e}));
             }
-        } catch (e) {
-            logger.warn(new Error('Failed to compare plays based on range but will continue', {cause: e}));
-        }
+            const windowEnd = baseEnd.add(30, 's');
 
-        // NOTE: these two checks intentionally anchor on existingPlay.data.playDate directly,
-        // NOT existingTsSOCDate -- existingTsSOCDate can resolve to playDateCompleted instead of
-        // playDate depending on the play's scrobbleTsSOC, which would put the window in the wrong
-        // place entirely (starting from roughly when the track ended, not when it started)
-        const existingPlayDate = existingPlay.data.playDate;
-        if(duringReferences.includes('listenedFor') && existingPlay.data.listenedFor !== undefined && existingPlayDate !== undefined) {
-            const listenedForEnd = existingPlayDate.add(existingPlay.data.listenedFor, 's');
-            if (candidateTsSOCDate.isBetween(existingPlayDate, listenedForEnd)) {
+            if (candidateTsSOCDate.isBetween(windowStart, windowEnd, undefined, '[]')) {
                 result.match = TA_DURING;
                 result.range = {
-                        type: 'listenedFor',
-                        timestamps: [existingPlayDate, listenedForEnd]
-                }
+                    type: existingPlay.data.duration !== undefined && duringReferences.includes('duration') ? 'duration' : 'listenedFor',
+                    timestamps: [windowStart, windowEnd]
+                };
                 return result;
             }
-        }
-
-        if(duringReferences.includes('duration') && existingPlay.data.duration !== undefined && existingPlayDate !== undefined) {
-            // prefer the play's actual observed completion time over the nominal duration --
-            // a real listen can take longer than the track's length if it was paused partway through,
-            // and playDateCompleted reflects that real wall-clock span while playDate + duration doesn't
-            const durationEnd = existingPlay.data.playDateCompleted ?? existingPlayDate.add(existingPlay.data.duration, 's');
-            if (candidateTsSOCDate.isBetween(existingPlayDate, durationEnd)) {
-                result.match = TA_DURING;
-                result.range = {
-                        type: 'duration',
-                        timestamps: [existingPlayDate, durationEnd]
+        } else {
+            // guard against old, badly cached/marshalled range data:
+            // this should not be an issue in 0.14.0+ since listenprogress has been updated to be a plain object
+            // but for folks migrating with very old cached data it could end up being an issue
+            try {
+                if (duringReferences.includes('range') && existingRanges !== undefined) {
+                    for (const range of existingRanges) {
+                        if (candidateTsSOCDate.isBetween(range.start.timestamp, range.end.timestamp)) {
+                            result.range = {
+                                type: 'range',
+                                timestamps: [range.start.timestamp, range.end.timestamp]
+                            };
+                            result.match = TA_DURING;
+                            return result;
+                        }
+                    }
                 }
-                return result;
+            } catch (e) {
+                logger.warn(new Error('Failed to compare plays based on range but will continue', {cause: e}));
             }
         }
-
     }
 
-    // if the source has a duration its possible one play was scrobbled at the beginning of the track and the other at the end
-    // so check if the duration matches the diff between the two play dates
-    if (result.match === TA_NONE && referenceDuration !== undefined) {
+    // Fuzzy duration matching is disabled for sequential plays unless explicitly requested via fuzzyDuration
+    if (result.match === TA_NONE && referenceDuration !== undefined && fuzzyDuration) {
         result.date.fuzzyDurationDiff = Math.abs(scrobblePlayDiff - referenceDuration);
-        if (result.date.fuzzyDurationDiff <= fuzzyDiffThreshold) { // TODO use finer comparison for this?
+        if (result.date.fuzzyDurationDiff <= fuzzyDiffThreshold) {
             result.match = TA_FUZZY;
         }
     }
-    // if the source has listened duration (maloja) it may differ from actual track duration
-    // and its possible (spotify) the candidate play date is set at the end of this duration
-    // so check if there is a close match between candidate play date and source + listened for
     if (result.match === TA_NONE && referenceListenedFor !== undefined && fuzzyDuration) {
         result.date.fuzzyListenedDiff = Math.abs(scrobblePlayDiff - referenceListenedFor);
-        if (result.date.fuzzyListenedDiff <= fuzzyDiffThreshold) { // TODO use finer comparison for this?
-            result.match = TA_FUZZY
+        if (result.date.fuzzyListenedDiff <= fuzzyDiffThreshold) {
+            result.match = TA_FUZZY;
         }
     }
 
@@ -348,84 +357,6 @@ export const parseDurationFromTimestamp = (timestamp: any) => {
         milliseconds: Number.parseInt(milli)
     });
 };
-
-/** Is Position earlier than X seconds or Y% percent of the start of a Play? */
-export const closeToPlayStart = (play: PlayObject, position: number, thresholds: {absolute?: number, percent?: number, hintPrefix?: boolean} = {}): [boolean, string] => {
-    const {
-        absolute = DEFAULT_CLOSE_POSITION_ABSOLUTE,
-        percent = DEFAULT_CLOSE_POSITION_PERCENT,
-        hintPrefix = true
-    } = thresholds;
-
-        const hintStart = hintPrefix ? `Position (${position}) ` : '';
-        const trackDur = play.data.duration;
-        const closeStartNum = position <= absolute;
-        const hints: string[] = [];
-        hints.push(`${closeStartNum ? 'is' : 'is not'} within ${absolute}s of track start`);
-
-        let closeStartPer = false;
-        if(trackDur !== undefined) {
-            const positionPercent = (position / trackDur);
-            closeStartPer = (positionPercent <= percent);
-            if(!closeStartNum) {
-                hints.push(`${closeStartPer ? 'is' : 'is not'} within ${formatNumber(percent * 100, {toFixed: 0})}% of track start (${formatNumber(positionPercent*100)}%)`);
-            }
-        }
-
-        return [closeStartNum || closeStartPer, `${hintStart}${hints.join(' and ')}`];
-}
-
-/** Is Position closer than X seconds or Y% percent of the end of a Play? */
-export const closeToPlayEnd = (play: PlayObject, position: number, thresholds: {absolute?: number, percent?: number, hintPrefix?: boolean} = {}): [boolean, string] => {
-    const {
-        absolute = DEFAULT_CLOSE_POSITION_ABSOLUTE,
-        percent = DEFAULT_CLOSE_POSITION_PERCENT,
-        hintPrefix = true
-    } = thresholds;
-
-        const hintStart = hintPrefix ? `Position (${position}) ` : '';
-        const trackDur = play.data.duration;
-
-        if(trackDur === undefined) {
-            return [false, `Cannot determine how close Position ${position} is to end of track because no duration data is available.`];
-        }
-
-        const nearEndNum = trackDur - position <= absolute;
-        const hints: string[] = [];
-        hints.push(`${nearEndNum ? 'is' : 'is not'} within ${absolute}s of track end`);
-        const positionPercent = 1 - (position / trackDur);
-        const nearEndPer = (positionPercent < percent);
-        if(!nearEndNum) {
-            hints.push(`${nearEndPer ? 'is' : 'is not'} within ${formatNumber(percent * 100, {toFixed: 0})}% of track end (${formatNumber(positionPercent*100)}%)`);
-        }
-        return [nearEndNum || nearEndPer, `${hintStart}${hints.join(' and ')}`];
-}
-
-/** Has more than X seconds or Y% percent of Play duration been played? */
-export const repeatDurationPlayed = (play: PlayObject, duration: number, thresholds: {absolute?: number, percent?: number, hintPrefix?: boolean} = {}): [boolean, string] => {
-    const {
-        absolute =  DEFAULT_DURATION_REPEAT_ABSOLUTE,
-        percent = DEFAULT_DURATION_REPEAT_PERCENT,
-        hintPrefix = true
-    } = thresholds;
-
-        const hintStart = hintPrefix ? `Duration listened (${duration}s) ` : '';
-        const trackDur = play.data.duration;
-        const absPlayed = duration >= absolute;
-        const hints: string[] = [];
-        hints.push(`${absPlayed ? 'is' : 'is not'} more than ${absolute}s`);
-
-        let majorityDurationPercent = false;
-        if(trackDur !== undefined) {
-            const durationPercent = (duration / trackDur);
-            majorityDurationPercent = (durationPercent >= percent);
-            if(!absPlayed) {
-                hints.push(`${majorityDurationPercent ? 'is' : 'is not'} more than ${formatNumber(percent * 100, {toFixed: 0})}% of track duration (${formatNumber(durationPercent*100)}%)`);
-            }
-        }
-
-        return [absPlayed || majorityDurationPercent, `${hintStart}${hints.join(' and ')}`];
-}
 
 /** Convert unix timestamp in microseconds to unix timestamp in seconds */
 export const usecToUnix = (usec: number): UnixTimestamp => {

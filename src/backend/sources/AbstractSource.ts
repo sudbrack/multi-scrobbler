@@ -2,7 +2,7 @@ import { childLogger, type LogDataPretty, type LogLevel } from '@foxxmd/logging'
 import dayjs, { type Dayjs } from "dayjs";
 import type { EventEmitter } from "events";
 import type { FixedSizeList } from "fixed-size-list";
-import { DEAD_LETTER_RETRIES_DEFAULT, DEAD_QUEUE, INGRESS_QUEUE, PARSED_FROM, type PlayMatchResult, type PlayObject, QUEUE_STATUS_COMPLETED, QUEUE_STATUS_FAILED, SOURCE_SOT } from "../../core/Atomic.ts";
+import { DEAD_LETTER_RETRIES_DEFAULT, DEAD_QUEUE, INGRESS_QUEUE, PARSED_FROM, type PlayMatchResult, type PlayObject, QUEUE_STATUS_COMPLETED, QUEUE_STATUS_FAILED, SCROBBLE_TS_SOC_END, SOURCE_SOT } from "../../core/Atomic.ts";
 import { capitalize, truncateStringToLength } from "../../core/StringUtils.ts";
 import { buildTrackString } from "../../core/MusicMetadata.ts";
 import AbstractComponent from "../common/AbstractComponent.ts";
@@ -456,11 +456,11 @@ export default abstract class AbstractSource extends AbstractComponent implement
     }
 
     protected recentDiscoveredCacheKey = () => {
-        return `recentDiscovered-${this.dbComponent.id}`;
+        return `recentDiscovered-${this.dbComponent?.id ?? this.name}`;
     }
 
     protected recentCacheKey = () => {
-        return `recent-${this.dbComponent.id}`;
+        return `recent-${this.dbComponent?.id ?? this.name}`;
     }
 
 
@@ -468,6 +468,9 @@ export default abstract class AbstractSource extends AbstractComponent implement
         const cacheKey = this.recentDiscoveredCacheKey();
         let list = await this.cache.cacheDb.get<PlayObject[]>(cacheKey);
         if(list === undefined && hydrate) {
+            if (this.playRepo === undefined) {
+                return [];
+            }
             list = (await this.playRepo.findPlays({
                 state: ['discovered'],
                 order: 'desc',
@@ -484,8 +487,11 @@ export default abstract class AbstractSource extends AbstractComponent implement
         const cacheKey = this.recentCacheKey();
         let list = await this.cache.cacheDb.get<PlayObject[]>(cacheKey);
         if(list === undefined && hydrate) {
+            if (this.playRepo === undefined) {
+                return [];
+            }
             list = (await this.playRepo.findPlays({
-                stateNot: ['queued'],
+                stateNot: ['queued', 'discarded'],
                 order: 'desc',
                 sort: 'playedAt',
                 limit: 200
@@ -497,7 +503,15 @@ export default abstract class AbstractSource extends AbstractComponent implement
     }) as RecentPlaysGetter;
 
     async existingDiscovered(play: PlayObject): Promise<PlayMatchResult> {
-        let list: PlayObject[] = await this.getRecentPlays(true);
+        let list: PlayObject[] = [...((await this.getRecentPlays(true)) ?? [])];
+        const isBacklogOrHistory = (play.meta.parsedFrom !== undefined && ([PARSED_FROM.backlog, PARSED_FROM.history] as PARSED_FROM_TYPE[]).includes(play.meta.parsedFrom))
+            || play.meta.scrobbleTsSOC === SCROBBLE_TS_SOC_END;
+        if (isBacklogOrHistory && this.playRepo !== undefined) {
+            const discardedClose = await this.playRepo.getTemporallyClosePlays(play, { states: ['discarded'] });
+            for (const row of discardedClose) {
+                list.push({ ...asPlay(row.play), id: row.id, uid: row.uid });
+            }
+        }
         if(play.id !== undefined) {
             // don't want to return the same play (by id) when checking by source
             list = list.filter(x => x.id === undefined || (x.id !== play.id));

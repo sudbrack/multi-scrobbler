@@ -229,6 +229,7 @@ describe('Player Cleanup', function () {
 
         let position = 0;
         let timeSince = 0;
+        let discoveredPlays: PlayObject[] = [];
 
         // simulate polling playing source for 30 seconds, 10 second interval
         for(let i = 0; i < 3; i++) {
@@ -237,8 +238,18 @@ describe('Player Cleanup', function () {
             MockDate.set(initialDate.add(position, 'seconds').toDate());
             await sleep(1);
             const advancedState = generatePlayerStateData({play: initialState.play, stateUpdatedAt: dayjs(), position, status: REPORTED_PLAYER_STATUSES.playing});
-            expect((await source.processRecentPlays([advancedState])).length).to.be.eq(0);
+            const res = await source.processRecentPlays([advancedState]);
+            if (i < 2) {
+                expect(res.length).to.be.eq(0);
+            } else {
+                // At 30s (60% of 50s track), play is discovered immediately upon crossing 50% threshold
+                expect(res.length).to.be.eq(1);
+                discoveredPlays = res;
+            }
         }
+
+        expect(discoveredPlays.length).to.be.eq(1);
+        expect(discoveredPlays[0].data.listenedFor).closeTo(30, 2);
 
         // simulate polling another 20 seconds without any updates from the Source
         for(let i = 0; i < 2; i++) {
@@ -250,10 +261,8 @@ describe('Player Cleanup', function () {
 
         MockDate.set(initialDate.add(timeSince + 2, 'seconds').toDate());
         await sleep(1);
-        const discoveredPlays = await source.processRecentPlays([]);
-        // cleanup should discover stale play
-        expect(discoveredPlays.length).to.be.eq(1);
-        expect(discoveredPlays[0].data.listenedFor).closeTo(30, 2);
+        // cleanup should not re-discover play already scrobbled at 50%
+        expect((await source.processRecentPlays([])).length).to.be.eq(0);
     } 
 
     it('Discovers cleaned up Play with correct duration (Non Positional Source)', async function () {
@@ -273,6 +282,7 @@ describe('Player Cleanup', function () {
 
         let position = 0;
         let timeSince = 0;
+        let discoveredPlays: PlayObject[] = [];
 
         // simulate polling playing source for 30 seconds, 10 second interval
         for(let i = 0; i < 3; i++) {
@@ -281,8 +291,17 @@ describe('Player Cleanup', function () {
             MockDate.set(initialDate.add(position, 'seconds').toDate());
             await sleep(1);
             const advancedState = generatePlayerStateData({play: initialState.play, stateUpdatedAt: dayjs(), position, status: REPORTED_PLAYER_STATUSES.playing});
-            expect((await source.processRecentPlays([advancedState])).length).to.be.eq(0);
+            const res = await source.processRecentPlays([advancedState]);
+            if (i < 2) {
+                expect(res.length).to.be.eq(0);
+            } else {
+                expect(res.length).to.be.eq(1);
+                discoveredPlays = res;
+            }
         }
+
+        expect(discoveredPlays.length).to.be.eq(1);
+        expect(discoveredPlays[0].data.listenedFor).closeTo(30, 2);
 
         // simulate polling another 20 seconds without any updates from the Source
         for(let i = 0; i < 2; i++) {
@@ -296,10 +315,8 @@ describe('Player Cleanup', function () {
 
         MockDate.set(initialDate.add(timeSince, 'seconds').toDate());
         await sleep(1);
-        const discoveredPlays = await source.processRecentPlays([]);
-        // cleanup should discover stale play
-        expect(discoveredPlays.length).to.be.eq(1);
-        expect(discoveredPlays[0].data.listenedFor).closeTo(30, 2);
+        // cleanup should not re-discover play already scrobbled at 50%
+        expect((await source.processRecentPlays([])).length).to.be.eq(0);
 
         timeSince += 10;
 
@@ -418,7 +435,8 @@ describe('Player Cleanup', function () {
         // so that loop starts 1 second after "paused" position
         position -= 9;
 
-        // simulate ~50 seconds of listening (enough for scrobble)
+        // simulate ~50 seconds of listening (enough for scrobble, crosses 45s threshold on i = 1)
+        let activeDiscovered: PlayObject[] = [];
         MockDate.set(initialDate.add(timeSince, 'seconds').toDate());
         for(let i = 0; i < 5; i++) {
             position += 10;
@@ -426,18 +444,21 @@ describe('Player Cleanup', function () {
             MockDate.set(initialDate.add(timeSince, 'seconds').toDate());
             await sleep(1);
             const advancedState = generatePlayerStateData({play: initialState.play, stateUpdatedAt: dayjs(), position, status: REPORTED_PLAYER_STATUSES.playing});
-            expect((await source.processRecentPlays([advancedState])).length).to.be.eq(0);
+            const res = await source.processRecentPlays([advancedState]);
+            activeDiscovered.push(...res);
         }
+
+        expect(activeDiscovered.length).to.be.eq(1);
+        expect(activeDiscovered[0].data.duration).to.be.closeTo(90, 2);
 
         timeSince += 10;
         MockDate.set(initialDate.add(timeSince, 'seconds').toDate());
         await sleep(1);
         // new Play
         const advancedState = generatePlayerStateData({stateUpdatedAt: dayjs(), position: 0, status: REPORTED_PLAYER_STATUSES.playing});
-        // should return discovered play with ~90 seconds of duration
+        // should not re-discover play on track switch because it was already discovered at 50%
         const plays = await source.processRecentPlays([advancedState])
-        expect(plays.length).to.be.eq(1);
-        expect(plays[0].data.duration).to.be.closeTo(90, 2);
+        expect(plays.length).to.be.eq(0);
 
     }
 

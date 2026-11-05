@@ -279,6 +279,82 @@ describe('Repository Operations', function () {
             expect(existing!.play.data.track?.name).eq(childPlay.data.track?.name);
         });
 
+        it('restricts live play search window strictly to [playedAt - 30s, playedAt + 30s]', async function () {
+            const db = await transientDb();
+            const component = await db.insert(components).values(fixtureCreateComponent()).returning();
+            const repo = new DrizzlePlayRepository(db, { componentId: component[0].id });
+
+            const baseTime = dayjs().subtract(10, 'minutes').startOf('second');
+            const livePlay1 = generatePlay({
+                track: nameToCredit('Live Track'),
+                duration: 200,
+                listenedFor: 100,
+                playDate: baseTime
+            }, {
+                newFromSource: true,
+                parsedFrom: 'player'
+            });
+
+            await repo.createPlays([{
+                ...fixtureCreatePlay({ play: livePlay1 }),
+                state: 'discovered',
+                input: { data: {} }
+            }]);
+
+            // Within 30s -> matches as existing
+            const liveWithin20s = clone(livePlay1);
+            liveWithin20s.data.playDate = baseTime.add(8, 'seconds');
+            expect(await repo.checkExisting(liveWithin20s, { states: ['discovered'] })).to.not.be.undefined;
+
+            // Outside 30s (e.g., 90s later for a replay or at baseTime + duration) -> NOT returned by getTemporallyClosePlays or checkExisting
+            const liveReplayAt90s = clone(livePlay1);
+            liveReplayAt90s.data.playDate = baseTime.add(90, 'seconds');
+            expect(await repo.getTemporallyClosePlays(liveReplayAt90s, { states: ['discovered'] })).to.be.empty;
+            expect(await repo.checkExisting(liveReplayAt90s, { states: ['discovered'] })).to.be.undefined;
+
+            const liveReplayAtDuration = clone(livePlay1);
+            liveReplayAtDuration.data.playDate = baseTime.add(200, 'seconds');
+            expect(await repo.getTemporallyClosePlays(liveReplayAtDuration, { states: ['discovered'] })).to.be.empty;
+            expect(await repo.checkExisting(liveReplayAtDuration, { states: ['discovered'] })).to.be.undefined;
+        });
+
+        it('matches backlog/history plays against completion window across discovered, scrobbled, and discarded states', async function () {
+            const db = await transientDb();
+            const component = await db.insert(components).values(fixtureCreateComponent()).returning();
+            const repo = new DrizzlePlayRepository(db, { componentId: component[0].id });
+
+            const baseTime = dayjs().subtract(20, 'minutes').startOf('second');
+            const skippedPlay = generatePlay({
+                track: nameToCredit('Sub50 Skip'),
+                duration: 200,
+                listenedFor: 35,
+                playDate: baseTime,
+                playDateCompleted: baseTime.add(35, 'seconds'),
+                listenRanges: [{ start: { timestamp: baseTime }, end: { timestamp: baseTime.add(35, 'seconds') } }]
+            }, {
+                parsedFrom: 'player'
+            });
+
+            await repo.createPlays([{
+                ...fixtureCreatePlay({ play: skippedPlay }),
+                state: 'discarded',
+                input: { data: {} }
+            }]);
+
+            // Backlog item arrives with completion timestamp at baseTime + 35s
+            const historyCandidate = clone(skippedPlay);
+            historyCandidate.data.playDate = baseTime.add(35, 'seconds');
+            historyCandidate.data.playDateCompleted = baseTime.add(35, 'seconds');
+            historyCandidate.data.listenedFor = undefined;
+            historyCandidate.data.listenRanges = undefined;
+            historyCandidate.meta.parsedFrom = 'backlog';
+            historyCandidate.meta.scrobbleTsSOC = 2;
+
+            const matchedDiscarded = await repo.checkExisting(historyCandidate, { states: ['discovered', 'scrobbled', 'discarded'] });
+            expect(matchedDiscarded).to.not.be.undefined;
+            expect(matchedDiscarded!.state).to.equal('discarded');
+        });
+
     });
 
 

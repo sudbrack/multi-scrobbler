@@ -366,10 +366,13 @@ export default class DeezerInternalSource extends MemorySource {
         if(this.config.options?.fuzzyDiscoveryIgnore === true || this.config.options?.fuzzyDiscoveryIgnore === 'aggressive') {
             const fuzzyIndex = (await findIndexAsync(list, async x => {
                 const e = await this.transformPlay(x, TRANSFORM_HOOK.existing);
-                let temporalOptions: TemporalPlayComparisonOptions = {};
+                let temporalOptions: TemporalPlayComparisonOptions = {
+                    fuzzyDuration: true
+                };
                 const temporalAccuracy: TemporalAccuracy[] = [TA_EXACT, TA_CLOSE, TA_FUZZY];
                 if(this.config.options?.fuzzyDiscoveryIgnore === 'aggressive') {
                     temporalOptions = {
+                        fuzzyDuration: true,
                         fuzzyDiffThreshold: x.data.duration !== undefined ? Math.max(100, x.data.duration * 0.5) : 100,
                         duringReferences: ['duration', 'listenedFor', 'range'],
                         logger: this.logger

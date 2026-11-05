@@ -1,5 +1,5 @@
 import { getListDiff, type ListDiff } from "@donedeal0/superdiff";
-import { type AcceptableTemporalDuringReference, type Credit, type PlayMatchResult, type PlayObject, type PlayObjectMinimal, SOURCE_SOT, type SOURCE_SOT_TYPES, TA_DURING, TA_EXACT, TA_FUZZY, type TemporalAccuracy, type TrackStringOptions } from "../../core/Atomic.ts";
+import { type AcceptableTemporalDuringReference, type Credit, PARSED_FROM, type PlayMatchResult, type PlayObject, type PlayObjectMinimal, SOURCE_SOT, type SOURCE_SOT_TYPES, TA_DURING, TA_EXACT, type TemporalAccuracy, type TrackStringOptions } from "../../core/Atomic.ts";
 import { capitalize, truncateStringToLength } from "../../core/StringUtils.ts";
 import { buildTrackString } from "../../core/MusicMetadata.ts";
 import { comparingMultipleArtists, playObjDataMatch, setIntersection } from "../utils.ts";
@@ -552,13 +552,8 @@ export const existingScrobble = async (playObjPre: PlayObject, existingScrobbles
                 return result;
             }
 
-            // only check for fuzzy if we know this play is NOT a repeat
-            // otherwise we may get a false positive on the previously played track ending time == repeat start time
-            // -- this is info we only know if play was generated from MS player so we can be reasonably sure
-            //
-            // OR if play was generated from a source that uses History (endpoint sources, lfm or lz history sources)
-            // then we can be reasonably sure that our candidate play has an accurate timestamp and wouldn't fuzzy match a previous scrobble
-            const looseTimeAccuracy = playObj.data.repeat || (playObj.meta.sourceSOT !== undefined && ([SOURCE_SOT.HISTORY, SOURCE_SOT.INGRESS] as SOURCE_SOT_TYPES[]).includes(playObj.meta.sourceSOT)) ? [TA_DURING] : [TA_FUZZY, TA_DURING];
+            // Fuzzy duration matching is disabled for sequential plays to prevent false-positive duplicate drops
+            const looseTimeAccuracy: TemporalAccuracy[] = [TA_DURING];
 
             
             existingScrobble = await findAsyncSequential(existingScrobbles, async (xPre) => {
@@ -569,15 +564,17 @@ export const existingScrobble = async (playObjPre: PlayObject, existingScrobbles
 
                 // a backlog/history play only carries a single reported timestamp, often marking
                 // roughly when the track finished rather than when it started -- if the existing play
-                // was actually live-tracked (has real listenRanges) then also accept a candidate whose
-                // timestamp simply falls within that play's own start-to-duration window, since that gap
-                // can't exceed the track's own length for a genuine duplicate of the same listen
+                // was live-tracked then also accept a candidate whose completion timestamp falls within
+                // the existing play's completion window
                 const candidateConfirmedLive = playObj.meta.newFromSource === true
+                    || playObj.meta.parsedFrom === PARSED_FROM.player
+                    || playObj.data.repeat === true
                     || (playObj.data.listenRanges !== undefined && playObj.data.listenRanges.length > 0);
-                const existingIsLiveTracked = x.data.listenRanges !== undefined && x.data.listenRanges.length > 0;
+                const existingIsLiveTracked = (x.data.listenRanges !== undefined && x.data.listenRanges.length > 0)
+                    || x.meta.parsedFrom === PARSED_FROM.player;
                 const duringReferences: AcceptableTemporalDuringReference | undefined = !candidateConfirmedLive && existingIsLiveTracked
                     ? ['range', 'listenedFor', 'duration']
-                    : undefined;
+                    : (candidateConfirmedLive ? [] : undefined);
 
                 const temporalComparison = comparePlayTemporally(x, playObj, {logger, duringReferences});
                 let timeMatch = 0;

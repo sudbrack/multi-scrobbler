@@ -254,7 +254,7 @@ describe('Detects duplicate and unique scrobbles from client recent history', fu
                 assert.isFalse((await testScrobbler.alreadyScrobbled(ballad2!))[0]);
             });
 
-            it('Is not detected as duplicate when play date matches fuzzy but play is marked as repeat', async function () {
+            it('Is not detected as duplicate when play date is separated by track duration (consecutive sequential play)', async function () {
 
                 const recent = normalizePlays(normalizedWithDur, {
                     initialDate: firstPlayDate,
@@ -266,7 +266,7 @@ describe('Detects duplicate and unique scrobbles from client recent history', fu
                 const repeatPlay = clone(recent[recent.length - 1]);
                 repeatPlay.data.playDate = repeatPlay.data.playDate!.add(repeatPlay.data.duration! + 2, 's');
 
-                assert.isTrue((await testScrobbler.alreadyScrobbled(repeatPlay))[0]);
+                assert.isFalse((await testScrobbler.alreadyScrobbled(repeatPlay))[0]);
 
                 repeatPlay.data.repeat = true;
                 assert.isFalse((await testScrobbler.alreadyScrobbled(repeatPlay))[0]);
@@ -353,7 +353,7 @@ describe('Detects duplicate and unique scrobbles from client recent history', fu
             assert.isTrue((await testScrobbler.alreadyScrobbled(timeOffPos))[0]);
             assert.isTrue((await testScrobbler.alreadyScrobbled(timeOffNeg))[0]);
 
-            // 10 seconds fuzzy diff inclusive
+            // Sequential play separated by ~duration is NOT a duplicate (fuzzy duration matching disabled)
             const son = normalizedWithMixedDurOlder.find(x => x.data.track?.name === 'Sonora')
             son!.data.playDate = dayjs().subtract(1, 'hour').set('minute', 26).set('second', 20);
             son!.data.duration = 267;
@@ -362,7 +362,7 @@ describe('Detects duplicate and unique scrobbles from client recent history', fu
 
             const offSon = clone(son);
             offSon!.data.playDate = dayjs().subtract(1, 'hour').set('minute', 30).set('second', 37);
-            assert.isTrue((await testScrobbler.alreadyScrobbled(offSon!))[0]);
+            assert.isFalse((await testScrobbler.alreadyScrobbled(offSon!))[0]);
         });
 
         it('Is detected as duplicate when play date is off by less than 60 seconds (low granularity source)', async function () {
@@ -401,7 +401,8 @@ describe('Detects duplicate and unique scrobbles from client recent history', fu
             const son = normalizedWithMixedDur.find(x => x.data.track?.name === 'Sonora')
 
             const sonDiffPlay = clone(son);
-            sonDiffPlay!.data.playDate = sonDiffPlay!.data.playDate!.subtract(son!.data.duration! + 1, 's');
+            sonDiffPlay!.data.playDate = sonDiffPlay!.data.playDate!.add(5, 's');
+            sonDiffPlay!.data.artists = [sonDiffPlay!.data.artists![1]];
             assert.isTrue((await testScrobbler.alreadyScrobbled(sonDiffPlay!))[0]);
         });
 
@@ -437,25 +438,28 @@ describe('Detects duplicate and unique scrobbles from client recent history', fu
 
         describe('When at least one play has duration', function () {
 
-            it('Is detected as duplicate when play date is close to the end of an existing scrobble', async function () {
+            it('Does NOT detect consecutive sequential play at playDate + duration as duplicate, but DOES detect backlog candidate in completion window of live-tracked play', async function () {
 
                 await using testScrobbler = await generateTestScrobbler();
                 testScrobbler.testRecentScrobbles = normalizedWithDur;
 
                 const timeEnd = clone(normalizedWithDur[normalizedWithMixedDur.length - 2]);
                 timeEnd.data.playDate = timeEnd.data.playDate!.add(timeEnd.data.duration!, 's');
+                timeEnd.meta.newFromSource = true;
 
-                assert.isTrue((await testScrobbler.alreadyScrobbled(timeEnd))[0]);
+                // Sequential live play at playDate + duration is NOT a duplicate
+                assert.isFalse((await testScrobbler.alreadyScrobbled(timeEnd))[0]);
 
-                // only one has duration
-                timeEnd.data.duration = undefined;
+                // Backlog candidate at playDate + duration against a live-tracked play IS a duplicate
+                const liveExisting = clone(normalizedWithDur[normalizedWithMixedDur.length - 2]);
+                liveExisting.meta.parsedFrom = 'player';
+                testScrobbler.testRecentScrobbles = [liveExisting];
 
-                assert.isTrue((await testScrobbler.alreadyScrobbled(timeEnd))[0]);
+                const backlogCandidate = clone(timeEnd);
+                backlogCandidate.meta.newFromSource = undefined;
+                backlogCandidate.meta.parsedFrom = 'backlog';
 
-                // only one has duration
-                timeEnd.data.duration = undefined;
-
-                assert.isTrue((await testScrobbler.alreadyScrobbled(timeEnd))[0]);
+                assert.isTrue((await testScrobbler.alreadyScrobbled(backlogCandidate))[0]);
             });
 
         });

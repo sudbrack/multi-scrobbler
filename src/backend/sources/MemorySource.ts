@@ -30,6 +30,8 @@ import { createPlayerOptions, type PlayerStateOptions } from "./PlayerState/Abst
 import { GenericPlayerState } from "./PlayerState/GenericPlayerState.ts";
 import { hashObject } from "../utils/StringUtils.ts";
 import type {ComponentSourceApiJson} from "../../core/Api.ts";
+import { playToRepositoryCreatePlayOpts } from "../common/database/drizzle/repositories/PlayRepository.ts";
+import { TRANSFORM_HOOK } from "../../core/Transform.ts";
 
 const EXPECTED_NON_DISCOVERED_REASON = 'not added because an identical play with the same timestamp was already discovered.';
 
@@ -139,31 +141,92 @@ export default class MemorySource extends AbstractSource {
             this.playerCleanupDiscoveryAttempt.set(key, true);
             // get play as completed
             const cleanupPlay = player.getPlayedObject(true);
-            let discoverablePlay: boolean;
             if(cleanupPlay !== undefined) {
-                const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(cleanupPlay);
-                discoverablePlay = discoverable;
-                if(this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
-                    player.logger.verbose({labels: label}, discoverableReason);
-                }
-                if(discoverable) {
-                    discoveredCleanupPlay = cleanupPlay;
-                    // we are discovering/scrobbling play 
-                    // and since player is now stale we should treat this "session" as ended
-                    // -- so if user resumes a stale play later its a new session (new real time period of them listening)
-                    // basically this is the same as if the player was orphaned and removed
-                    // 
-                    // so we remove listen ranges so the old accumulated listen time can't be used for the "new" listening session
-                    player.listenRanges = [];
-                    player.currentListenRange = undefined;
+                if (player.hasScrobbled) {
+                    await this.updateCompletedPlay(cleanupPlay);
+                } else {
+                    const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(cleanupPlay);
+                    if(this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
+                        player.logger.verbose({labels: label}, discoverableReason);
+                    }
+                    if(discoverable) {
+                        discoveredCleanupPlay = cleanupPlay;
+                        player.hasScrobbled = true;
+                    }
                 }
             }
         }
         if(deletePlayer) {
+            if (!player.hasScrobbled) {
+                const cleanupPlay = player.getPlayedObject(true);
+                if (cleanupPlay !== undefined && (cleanupPlay.data.listenedFor ?? 0) > 0) {
+                    await this.persistDiscardedPlay(cleanupPlay);
+                }
+            }
             this.deletePlayer(player.platformIdStr, `Removed after being orphaned for ${timeToHumanTimestamp(dayjs.duration(player.stateIntervalOptions.orphanedInterval, 'seconds'))}`);
         }
 
         return discoveredCleanupPlay;
+    }
+
+    protected persistDiscardedPlay = async (play: PlayObject): Promise<void> => {
+        if (this.playRepo === undefined || this.dbComponent === undefined) {
+            return;
+        }
+        const existing = await this.existingDiscovered(play);
+        if (existing.match) {
+            return;
+        }
+        const playWithParsedFrom: PlayObject = {
+            ...play,
+            meta: {
+                ...play.meta,
+                parsedFrom: PARSED_FROM.player
+            }
+        };
+        const { lifecycle = [], ...preCompared } = await this.transformPlay(playWithParsedFrom, TRANSFORM_HOOK.preCompare);
+        const createPlayData = playToRepositoryCreatePlayOpts({
+            play: {
+                data: preCompared.data,
+                meta: preCompared.meta,
+                original: preCompared.original
+            },
+            componentId: this.dbComponent.id,
+            state: 'discarded',
+            parentId: preCompared.id
+        });
+        await this.playRepo.createPlays([createPlayData]);
+    }
+
+    protected updateCompletedPlay = async (completedPlay: PlayObject): Promise<void> => {
+        const existing = await this.existingDiscovered(completedPlay);
+        if (!existing.match || existing.closestMatchedPlay === undefined) {
+            return;
+        }
+        const matched = existing.closestMatchedPlay;
+        matched.data.playDateCompleted = completedPlay.data.playDateCompleted;
+        matched.data.listenedFor = completedPlay.data.listenedFor;
+        matched.data.listenRanges = completedPlay.data.listenRanges;
+
+        const recentPlays = await this.cache.cacheDb.get<PlayObject[]>(this.recentCacheKey());
+        if (recentPlays !== undefined) {
+            const idx = recentPlays.findIndex(x => (matched.id !== undefined && x.id === matched.id) || (x.data.playDate !== undefined && matched.data.playDate !== undefined && x.data.playDate.isSame(matched.data.playDate) && playObjDataMatch(x, matched)));
+            if (idx !== -1) {
+                recentPlays[idx] = matched;
+                await this.cache.cacheDb.set(this.recentCacheKey(), recentPlays, '2m');
+            }
+        }
+        const recentDiscovered = await this.cache.cacheDb.get<PlayObject[]>(this.recentDiscoveredCacheKey());
+        if (recentDiscovered !== undefined) {
+            const idx = recentDiscovered.findIndex(x => (matched.id !== undefined && x.id === matched.id) || (x.data.playDate !== undefined && matched.data.playDate !== undefined && x.data.playDate.isSame(matched.data.playDate) && playObjDataMatch(x, matched)));
+            if (idx !== -1) {
+                recentDiscovered[idx] = matched;
+                await this.cache.cacheDb.set(this.recentDiscoveredCacheKey(), recentDiscovered, '2m');
+            }
+        }
+        if (this.playRepo !== undefined && matched.id !== undefined) {
+            await this.playRepo.updateById(matched.id, { play: matched });
+        }
     }
 
     playersToObject = (): Record<string, SourcePlayerObj> => {
@@ -189,7 +252,7 @@ export default class MemorySource extends AbstractSource {
 
     setNewPlayer = (idStr: string, logger: Logger, id: PlayPlatformId, opts: PlayerStateOptions = {}): AbstractPlayerState => {
         const player = this.getNewPlayer(this.logger, id, {
-            ...createPlayerOptions(this.config.data as Partial<PollingOptions>, this.playerSourceOfTruth, this.logger),
+            ...createPlayerOptions(this.config.data as Partial<PollingOptions>, this.playerSourceOfTruth, this.logger, this.config.options?.scrobbleThresholds),
             ...opts
         });
         this.players.set(idStr, player);
@@ -309,21 +372,36 @@ export default class MemorySource extends AbstractSource {
                     playerState.position = playerState.play.meta?.trackProgressPosition;
                 }
 
+                const wasScrobbledBeforeUpdate = player.hasScrobbled;
                 const [currPlay, prevPlay] = player.update(playerState, reportedTS);
-                const candidate = prevPlay !== undefined ? prevPlay : currPlay;
-                const playChanged = prevPlay !== undefined;
 
-                // wait to discover play until it is stale or current play has changed
-                // so that our discovered track has an accurate "listenedFor" count
-                if (candidate !== undefined && (playChanged || player.isUpdateStale())) {
-                    const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(candidate);
-                    if(discoverable) {
-                        if(this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
+                if (prevPlay !== undefined) {
+                    if (wasScrobbledBeforeUpdate) {
+                        await this.updateCompletedPlay(prevPlay);
+                    } else {
+                        const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(prevPlay);
+                        if (this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
                             player.logger.verbose(discoverableReason);
                         }
-                        newStatefulPlays.push(candidate)
-                    } else if(playChanged && this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
-                        player.logger.verbose(discoverableReason);
+                        if (discoverable) {
+                            newStatefulPlays.push(prevPlay);
+                        } else if ((prevPlay.data.listenedFor ?? 0) > 0) {
+                            await this.persistDiscardedPlay(prevPlay);
+                        }
+                    }
+                }
+
+                const currAlreadyScrobbled = prevPlay === undefined && wasScrobbledBeforeUpdate;
+                if (currPlay !== undefined && !currAlreadyScrobbled && (player.hasScrobbled || player.isUpdateStale())) {
+                    const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(currPlay);
+                    if (discoverable) {
+                        if (this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
+                            player.logger.verbose(discoverableReason);
+                        }
+                        player.hasScrobbled = true;
+                        newStatefulPlays.push(currPlay);
+                    } else if (!player.passesScrobbleThreshold()) {
+                        player.hasScrobbled = false;
                     }
                 }
 
@@ -368,30 +446,18 @@ export default class MemorySource extends AbstractSource {
         const thresholdResults = timePassesScrobbleThreshold(scrobbleThresholds, candidate.data.listenedFor ?? 0, candidate.data.duration);
 
         if (thresholdResults.passes) {
-            const matchingRecent = await this.existingDiscovered(candidate); //sRecentlyPlayed.find(x => playObjDataMatch(x, candidate));
+            const matchingRecent = await this.existingDiscovered(candidate);
             if (matchingRecent.match === false) {
                 return [true,`${stPrefix} added after ${thresholdResultSummary(thresholdResults)} and not matching any prior plays`];
             } else {
-                const {data: {playDate, duration}} = candidate;
+                const {data: {playDate}} = candidate;
                 // existingPlay always sets closestMatchedPlay when match is true
                 const rplayDate = matchingRecent.closestMatchedPlay?.data.playDate;
                 if (playDate === undefined || rplayDate === undefined) {
                     return [false, `${stPrefix} matched a prior play but could not compare timestamps because a play date is missing`];
                 }
                 if (!playDate.isSame(rplayDate)) {
-                    if (duration !== undefined) {
-                        if (playDate.isAfter(rplayDate.add(duration, 's'))) {
-                            return [true,`${stPrefix} added after ${thresholdResultSummary(thresholdResults)} and having a different timestamp than a prior play`];
-                        }
-                        return [false, `${stPrefix} ${EXPECTED_NON_DISCOVERED_REASON}`]
-                    } else {
-                        const discoveredPlays = await this.getRecentlyDiscoveredPlays();
-                        if (discoveredPlays.length === 0 || !playObjDataMatch(discoveredPlays[0], candidate)) {
-                            // if most recent stateful play is not this track we'll add it
-                            return [true,`${stPrefix} added after ${thresholdResultSummary(thresholdResults)}. Matched other recent play but could not determine time frame due to missing duration. Allowed due to not being last played track.`];
-                        }
-                        return [false, `${stPrefix} not added because it matched the last discovered play and could not determine time frame of play`];
-                    }
+                    return [true,`${stPrefix} added after ${thresholdResultSummary(thresholdResults)} and having a different timestamp than a prior play`];
                 } else {
                     return [false, `${stPrefix} ${EXPECTED_NON_DISCOVERED_REASON}`];
                 }
