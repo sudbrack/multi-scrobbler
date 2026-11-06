@@ -9,12 +9,13 @@ In `multi-scrobbler`, Spotify replay tracking (e.g. rewinding near the end of a 
 3. **History Reconcile Mismatches & Zombie Skips**: Background reconciliation from Spotify's Recently Played API (`/v1/me/player/recently-played`) collided with live-tracked plays due to pauses and early skips, while also resurrecting 30-second skips that the live player deliberately rejected.
 
 ### The Solution Architecture
-Adopt the **Web Scrobbler / ListenBrainz Model**:
-1. **The 50% Scrobble Trigger**: As soon as a track accumulates 50% of its duration (or 4 minutes) of listen time, it is marked as scrobbled and emitted immediately.
-2. **Cumulative Listening Model (Pre-50%)**: Any seeking, looping, or rewinding *before* reaching 50% is treated strictly as seeking within the same play session. Listened seconds continuously accumulate into `listenedFor`. No replay detection occurs before 50%.
-3. **Symmetric Rewind Detection with Start Guard (Post-50% Replay)**: Once `hasScrobbled === true`, a replay is detected if the playback position drops backwards by at least 50% (or 4 minutes) **AND** the new position lands near the start of the track (<= 30s or <= 15% of duration). When triggered, the current session closes and a fresh listening session initializes for Play #2.
-4. **Clean 30-Second Deduplication**: Deduplication across identical live sequential tracks only matches if timestamps fall within a narrow **±30-second window**. Eliminate duration-spanning search windows and false fuzzy matches for live sequential plays.
-5. **Completion-Window & Discard-Aware History Reconcile**: Reconcile Spotify backlog plays by matching Spotify's completion timestamp (`pa`) against a completion window `[playDate + listenedFor - 30s, playDate + duration + 30s]`. Persist skipped tracks as `state: 'discarded'` so history reconciliation does not resurrect sub-50% skips, while fully recovering genuine missed plays from Spotify API transient blackouts.
+Adopt the **Option A Session-End Scrobble Model with 50% Replay Guarding**:
+1. **The 50% Threshold Qualification & Replay Arming**: As soon as a track accumulates 50% of its duration (or 4 minutes) of listen time, `hasScrobbled` is armed to `true`. This qualifies the play for scrobbling and activates post-50% replay detection (`isPositionRewind`).
+2. **Session-End Emission for Accurate Listening Time**: To ensure clients tracking actual listening duration (Maloja via `scrobbleData.duration = listenedFor` and ListenBrainz/Koito via `duration_played = Math.floor(play.data.listenedFor)`) receive the full, accurate listening time rather than a premature 50% truncation, live plays are emitted when the listening session ends (`prevPlay` on track transition, `prevPlay` on post-50% rewind replay, or `cleanupPlay` on stale player pause).
+3. **Cumulative Listening Model (Pre-50%)**: Any seeking, looping, or rewinding *before* reaching 50% is treated strictly as seeking within the same play session. Listened seconds continuously accumulate into `listenedFor`. No replay detection occurs before 50%.
+4. **Symmetric Rewind Detection with Start Guard (Post-50% Replay)**: Once `hasScrobbled === true`, a replay is detected if the playback position drops backwards by at least 50% (or 4 minutes) **AND** the new position lands near the start of the track (<= 30s). When triggered, session #1 closes and emits with full listening duration, and a fresh listening session initializes for Play #2.
+5. **Clean 30-Second Deduplication**: Deduplication across identical live sequential tracks only matches if timestamps fall within a narrow **±30-second window**. Eliminate duration-spanning search windows and false fuzzy matches for live sequential plays.
+6. **Completion-Window & Discard-Aware History Reconcile**: Reconcile Spotify backlog plays by matching Spotify's completion timestamp (`pa`) against a completion window `[playDate + minCompletionOffset - 30s, max(playDate + duration, playDateCompleted, pauseProjectedEnd) + 30s]`. Persist skipped tracks as `state: 'discarded'` so history reconciliation does not resurrect sub-50% skips, while fully recovering genuine missed plays from Spotify API transient blackouts.
 
 ---
 
@@ -32,7 +33,7 @@ Adopt the **Web Scrobbler / ListenBrainz Model**:
 
 ## 3. Core Architecture & Lifecycle
 
-### 3.1 Live Player Lifecycle (`AbstractPlayerState`)
+### 3.1 Live Player Lifecycle (`AbstractPlayerState` & `MemorySource`)
 
 ```
 T = 0:00               T = 1:30 (50%)                    T = 2:40 (Rewind)
@@ -40,16 +41,19 @@ T = 0:00               T = 1:30 (50%)                    T = 2:40 (Rewind)
    ▼                          ▼                                 ▼
 Track Starts           Threshold Met!                    Position drops to 0:05
 • playFirstSeenAt = T  • hasScrobbled = true             • hasScrobbled was true
-• hasScrobbled = false • EMIT SCROBBLE                   • Drop >= 50% AND Pos <= 30s:
-                         (timestamp = playFirstSeenAt)   • Reset session:
+• hasScrobbled = false • Replay Armed                    • Drop >= 50% AND Pos <= 30s:
+• hasEmitted = false   • Actively playing: wait          • EMIT Play #1 (prevPlay)
+                         until session ends to scrobble    with full 160s duration!
+                         full accurate listenedFor!      • Reset session:
                                                            - playFirstSeenAt = now
                                                            - hasScrobbled = false
+                                                           - hasEmitted = false
                                                            - listenRanges = []
                                                          • Play #2 begins!
 ```
 
 1. **New Play Starts**:
-   - Initialize `hasScrobbled = false`.
+   - Initialize `hasScrobbled = false` and `hasEmittedCurrentPlay = false`.
    - Set `playFirstSeenAt` to the track's true start timestamp (derived from Spotify server timestamp minus progress, not snapshot reception time).
 2. **Cumulative Listening (Pre-50%)**:
    - Any rewinds, intro loops, or backward seeks before reaching 50% are treated as normal seeking.
@@ -57,26 +61,26 @@ Track Starts           Threshold Met!                    Position drops to 0:05
    - Total duration across all ranges accumulates into `listenedFor`.
    - This total is track-duration-invariant and can legitimately exceed 100% of the track length if the listener loops sections before scrobbling.
    - No replay detection is performed while `hasScrobbled === false`.
-3. **Threshold Reached (Immediate Scrobble)**:
+3. **Threshold Reached (Replay Armed & Qualification)**:
    - When cumulative `listenedFor` satisfies the threshold (>= 50% of duration or >= 4 minutes):
      - Set `hasScrobbled = true`.
-     - Emit the play immediately as a completed scrobble candidate.
-     - Continue tracking progress for the "Now Playing" UI without double-scrobbling.
+     - Arms replay rewind detection.
+     - While actively playing, emission is deferred until the listening session completes so clients (like Maloja and ListenBrainz) record accurate total listening time instead of premature 50% duration.
 4. **Post-50% Rewind (Replay Detection with Start Guard)**:
    - To qualify as a Replay, an incoming playback update must satisfy:
      1. `hasScrobbled === true` (track already qualified for its first scrobble).
      2. `dropped >= threshold` (position dropped backwards by >= 50% of duration or >= 4 minutes).
      3. **Start Guard**: `newPosition <= 30` (the user actually rewound near the beginning of the track, within the first 30 seconds).
-   - **Why the Start Guard is critical**: On long tracks (e.g. 10–15 minute songs or podcasts), seeking backward from 8:00 to 3:30 drops 4.5 minutes. Without the start guard, that mid-track scrub would falsely trigger a brand new replay session. The start guard ensures only genuine restarts trigger Play #2.
    - When conditions are met:
-     - Recognize as a **Replay**.
-     - Reset `hasScrobbled = false`.
+     - Close session for Play #1. Emits Play #1 as `prevPlay` with accurate completed duration and `playDateCompleted`.
+     - Reset `hasScrobbled = false` and `hasEmittedCurrentPlay = false`.
      - Reset `playFirstSeenAt` to the current timestamp.
      - Clear `listenRanges`.
-     - Begin Play #2 as a fresh listening session. When Play #2 hits 50%, it scrobbles with its own timestamp.
-5. **Rapid Track Switches (A → B → A)**:
-   - If Song B plays, Song A's session is terminated.
-   - If the user clicks back to Song A after a few seconds: Song B has not reached 50% and is recorded as discarded. Song A begins as a brand new play session with `hasScrobbled = false` and its own start timestamp.
+     - Begin Play #2 as a fresh listening session.
+5. **Session End & Track Transitions**:
+   - On track completion / switch: `prevPlay` emits with full listening duration (`listenedFor`) and `playDateCompleted`.
+   - On stale player (pause > staleInterval): `cleanupPlayer` emits the in-progress play. If unpaused later and completed, `updateCompletedPlay` updates the existing database record without re-scrobbling.
+   - Sub-50% skips are persisted as `state: 'discarded'`.
 
 ---
 
@@ -151,13 +155,13 @@ Mark as DUPED.              (< 50% threshold).             SCROBBLE IT FRESH!
 ## 5. Architectural Responsibilities by Component
 
 * **`AbstractPlayerState`**:
-  - Manages `hasScrobbled` state.
+  - Manages `hasScrobbled` (qualification & replay arming) and `hasEmittedCurrentPlay` state.
   - Accumulates `listenRanges` into duration-invariant `listenedFor`.
-  - Emits scrobble immediately upon hitting the threshold.
   - Evaluates `isPositionRewind` with both the threshold drop check AND the start guard (`newPosition <= 30`).
 * **`MemorySource`**:
-  - Discovers candidate plays emitted at 50% immediately without duration locking.
+  - Emits candidate plays on session end (`prevPlay` on track transition or replay rewind; `cleanupPlay` on stale player) so clients receive accurate `listenedFor` and `playDateCompleted`.
   - When a track transitions without meeting threshold, persists it to the database with `state: 'discarded'`.
+  - Updates previously emitted stale plays via `updateCompletedPlay` on later completion without duplicate scrobbles.
 * **`PlayRepository`**:
   - Restricts duplicate search windows for live plays to strictly `[playedAt - 30s, playedAt + 30s]`.
   - For backlog queries, checks completion window matching against existing plays across all states (`scrobbled`, `discarded`).
@@ -173,10 +177,10 @@ Mark as DUPED.              (< 50% threshold).             SCROBBLE IT FRESH!
 
 ## 6. Verification Checklist for the Implementing Agent
 
-1. **Live Scrobble Timing**: Verify scrobbles emit at 50% of track duration (or 4 minutes), not at track end.
-2. **Cumulative Listening**: Verify seeking backwards before 50% keeps accumulating listen time and scrobbles once cumulative duration hits 50%, even if total duration exceeds 100%.
+1. **Session-End Scrobble with Full Duration**: Verify scrobbles emit at track end, replay rewind, or stale cleanup with accurate, full `listenedFor`, rather than truncated at 50%.
+2. **Cumulative Listening**: Verify seeking backwards before 50% keeps accumulating listen time and qualifies once cumulative duration hits 50%, even if total duration exceeds 100%.
 3. **Replays with Start Guard**:
-   - Verify rewinding to 0:05 after 50% cleanly resets state and emits a second scrobble once the replay reaches 50%.
+   - Verify rewinding to 0:05 after 50% cleanly resets state and emits Play #1 with full duration, and Play #2 emits on its completion.
    - Verify rewinding from 8:00 to 3:30 on a 12-minute track does NOT trigger a replay.
 4. **Deduplication**: Verify sequential replays of identical tracks are never flagged as duplicates.
 5. **Early Skips & Pauses vs. Reconcile**: Verify pausing for 2 minutes or skipping at 60% does not cause duplicate scrobbles when the 15-minute history reconcile runs.

@@ -142,7 +142,7 @@ export default class MemorySource extends AbstractSource {
             // get play as completed
             const cleanupPlay = player.getPlayedObject(true);
             if(cleanupPlay !== undefined) {
-                if (player.hasScrobbled) {
+                if (player.hasEmittedCurrentPlay) {
                     await this.updateCompletedPlay(cleanupPlay);
                 } else {
                     const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(cleanupPlay);
@@ -151,13 +151,14 @@ export default class MemorySource extends AbstractSource {
                     }
                     if(discoverable) {
                         discoveredCleanupPlay = cleanupPlay;
+                        player.hasEmittedCurrentPlay = true;
                         player.hasScrobbled = true;
                     }
                 }
             }
         }
         if(deletePlayer) {
-            if (!player.hasScrobbled) {
+            if (!player.hasEmittedCurrentPlay) {
                 const cleanupPlay = player.getPlayedObject(true);
                 if (cleanupPlay !== undefined && (cleanupPlay.data.listenedFor ?? 0) > 0) {
                     await this.persistDiscardedPlay(cleanupPlay);
@@ -372,11 +373,11 @@ export default class MemorySource extends AbstractSource {
                     playerState.position = playerState.play.meta?.trackProgressPosition;
                 }
 
-                const wasScrobbledBeforeUpdate = player.hasScrobbled;
+                const wasEmittedBeforeUpdate = player.hasEmittedCurrentPlay;
                 const [currPlay, prevPlay] = player.update(playerState, reportedTS);
 
                 if (prevPlay !== undefined) {
-                    if (wasScrobbledBeforeUpdate) {
+                    if (wasEmittedBeforeUpdate) {
                         await this.updateCompletedPlay(prevPlay);
                     } else {
                         const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(prevPlay);
@@ -391,17 +392,15 @@ export default class MemorySource extends AbstractSource {
                     }
                 }
 
-                const currAlreadyScrobbled = prevPlay === undefined && wasScrobbledBeforeUpdate;
-                if (currPlay !== undefined && !currAlreadyScrobbled && (player.hasScrobbled || player.isUpdateStale())) {
-                    const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(currPlay);
+                if (currPlay !== undefined && !player.hasEmittedCurrentPlay && player.isUpdateStale()) {
+                    const stalePlay = player.getPlayedObject(true) ?? currPlay;
+                    const [discoverable, discoverableReason] = await this.isListenedPlayDiscoverable(stalePlay);
                     if (discoverable) {
                         if (this.playerSourceOfTruth === SOURCE_SOT.PLAYER) {
                             player.logger.verbose(discoverableReason);
                         }
-                        player.hasScrobbled = true;
-                        newStatefulPlays.push(currPlay);
-                    } else if (!player.passesScrobbleThreshold()) {
-                        player.hasScrobbled = false;
+                        player.hasEmittedCurrentPlay = true;
+                        newStatefulPlays.push(stalePlay);
                     }
                 }
 

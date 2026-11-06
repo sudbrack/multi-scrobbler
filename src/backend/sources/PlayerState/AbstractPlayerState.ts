@@ -88,6 +88,7 @@ export abstract class AbstractPlayerState {
     playLastUpdatedAt?: Dayjs
     isRepeatPlay?: boolean = false;
     hasScrobbled: boolean = false;
+    hasEmittedCurrentPlay: boolean = false;
     currentListenRange?: ListenRange
     listenRanges: ListenRange[] = [];
     createdAt: Dayjs = dayjs();
@@ -303,6 +304,7 @@ export abstract class AbstractPlayerState {
         this.currentListenRange = undefined;
         this.isRepeatPlay = false;
         this.hasScrobbled = false;
+        this.hasEmittedCurrentPlay = false;
     }
 
     protected stopPlayer() {
@@ -434,6 +436,7 @@ export abstract class AbstractPlayerState {
 
         this.currentPlay = play;
         this.hasScrobbled = false;
+        this.hasEmittedCurrentPlay = false;
         if (!isRepeat && (play.meta.scrobbleTsSOC === SCROBBLE_TS_SOC_START || (reportedTS === undefined && play.meta.newFromSource === true)) && play.data.playDate !== undefined) {
             this.playFirstSeenAt = play.data.playDate;
         } else {
@@ -528,6 +531,7 @@ export abstract class AbstractPlayerState {
         newPlayer.playFirstSeenAt = this.playFirstSeenAt;
         newPlayer.playLastUpdatedAt = this.playLastUpdatedAt;
         newPlayer.hasScrobbled = this.hasScrobbled;
+        newPlayer.hasEmittedCurrentPlay = this.hasEmittedCurrentPlay;
     }
 }
 
