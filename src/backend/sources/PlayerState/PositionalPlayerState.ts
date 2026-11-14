@@ -49,7 +49,7 @@ export class PositionalPlayerState extends AbstractPlayerState {
         if (this.currentListenRange === undefined) {
             this.logger.debug('Started new Player listen range.');
             let usedPosition = position;
-            if (this.calculatedStatus === CALCULATED_PLAYER_STATUSES.playing && position !== undefined && position <= 3) {
+            if (this.listenRanges.length === 0 && this.calculatedStatus === CALCULATED_PLAYER_STATUSES.playing && position !== undefined && position <= 3) {
                 // likely the player has moved to a new track from a previous track (still calculated as playing)
                 // and polling/network delays means we did not catch absolute beginning of track
                 usedPosition = 1;

@@ -365,6 +365,38 @@ describe('Compare lists by order', function () {
                 const res = await existingScrobble(pausedBacklogCandidate, [pausedLiveTrackedPlay]);
                 assert.isTrue(res.match, 'a backlog candidate inside the real (paused) completion window should match even past nominal duration');
             });
+
+            it('matches a backlog candidate landing in pause-projected completion window when playDateCompleted is not set', async function() {
+                const pausedStart = dayjs('2026-09-08T04:00:00.000Z');
+                const pausedDuration = 200;
+                // Listened for 110s total across a 120s mid-track pause (ended at 04:03:50), remaining duration = 90s -> projectedEnd = 04:05:20
+                const pausedInFlightPlay: PlayObject = generatePlay({
+                    track: nameToCredit('Paused Track'),
+                    artists: namesToCredits(['Test Artist']),
+                    duration: pausedDuration,
+                    playDate: pausedStart,
+                    listenedFor: 110,
+                    listenRanges: [
+                        { start: { timestamp: pausedStart }, end: { timestamp: pausedStart.add(50, 's') } },
+                        { start: { timestamp: pausedStart.add(170, 's') }, end: { timestamp: pausedStart.add(230, 's') } }
+                    ]
+                }, {
+                    parsedFrom: 'player'
+                });
+
+                const backlogCandidate: PlayObject = generatePlay({
+                    track: nameToCredit('Paused Track'),
+                    artists: namesToCredits(['Test Artist']),
+                    duration: pausedDuration,
+                    playDate: pausedStart.add(320, 's') // 04:05:20 (120s past playDate + duration)
+                }, {
+                    parsedFrom: 'backlog',
+                    scrobbleTsSOC: SCROBBLE_TS_SOC_END
+                });
+
+                const res = await existingScrobble(backlogCandidate, [pausedInFlightPlay]);
+                assert.isTrue(res.match, 'a backlog candidate inside pauseProjectedEnd should match even when playDateCompleted is undefined');
+            });
         });
 
     });

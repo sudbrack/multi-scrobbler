@@ -3,7 +3,7 @@ import dayjs, { type Dayjs } from "dayjs";
 import { and, eq, inArray, isNull, relationsFilterToSQL, sql } from "drizzle-orm";
 import assert from "node:assert";
 import type { MarkOptional, ElementOf } from "ts-essentials";
-import { type DateLike, type DeepReplaceValue, type PlayObject, type PlayState, QUEUE_STATUS_QUEUED, type QueueName, SCROBBLE_TS_SOC_END, TA_DEFAULT_ACCURACY, type TemporalAccuracy } from "../../../../../core/Atomic.ts";
+import { type DateLike, type DeepReplaceValue, PARSED_FROM, type PARSED_FROM_TYPE, type PlayObject, type PlayState, QUEUE_STATUS_QUEUED, type QueueName, SCROBBLE_TS_SOC_END, TA_DEFAULT_ACCURACY, TA_DURING, type TemporalAccuracy } from "../../../../../core/Atomic.ts";
 import { removeUndefinedKeys } from '../../../../../core/DataUtils.ts';
 import { shortTodayAwareFormat } from "../../../../../core/TimeUtils.ts";
 import { playContentBasicInvariantTransform, playMbidIdentifier } from "../../../../utils/PlayComparisonUtils.ts";
@@ -721,9 +721,19 @@ export class DrizzlePlayRepository extends DrizzleBaseRepository<'plays'> {
                 queueStatus: 'queued'
             }
         }
+        const [, SOT] = getScrobbleTsSOCDateWithContext(play);
+        const isBacklogOrHistory = (play.meta.parsedFrom !== undefined && ([PARSED_FROM.backlog, PARSED_FROM.history] as PARSED_FROM_TYPE[]).includes(play.meta.parsedFrom))
+            || SOT === SCROBBLE_TS_SOC_END;
+
         if(states !== undefined) {
             where.state = {
                 in: states
+            }
+        } else if (!isBacklogOrHistory) {
+            where.state = {
+                NOT: {
+                    in: ['discarded']
+                }
             }
         }
 
@@ -815,9 +825,12 @@ export class DrizzlePlayRepository extends DrizzleBaseRepository<'plays'> {
          * 
          * but the *playedAt* date will still be the same since that is something we don't ever transform
          */
+        const effectiveTaAccuracy = isBacklogOrHistory && opts.taAccuracy === undefined
+            ? [...TA_DEFAULT_ACCURACY, TA_DURING]
+            : taAccuracy;
         return res.map(x => ({...x, play: hydratePlaySelect(x)})).find(x => {
             const temporalComparison = comparePlayTemporally(x.play, play, {logger: this.logger});
-            return hasAcceptableTemporalAccuracy(temporalComparison.match, taAccuracy)
+            return hasAcceptableTemporalAccuracy(temporalComparison.match, effectiveTaAccuracy)
         })
     }
 
@@ -834,11 +847,21 @@ export class DrizzlePlayRepository extends DrizzleBaseRepository<'plays'> {
 
         const where: FindWhere<'plays'> = {
             componentId,
-            playedAt: buildDateCompare(getTemporallyCloseDateCompareOp(play, {bufferTime})),
+            playedAt: buildDateCompare(getTemporallyCloseDateCompareOp(play, {bufferTime, useDuration: true})),
         };
+        const [, SOT] = getScrobbleTsSOCDateWithContext(play);
+        const isBacklogOrHistory = (play.meta.parsedFrom !== undefined && ([PARSED_FROM.backlog, PARSED_FROM.history] as PARSED_FROM_TYPE[]).includes(play.meta.parsedFrom))
+            || SOT === SCROBBLE_TS_SOC_END;
+
         if(states !== undefined) {
             where.state = {
                 in: states
+            }
+        } else if (!isBacklogOrHistory) {
+            where.state = {
+                NOT: {
+                    in: ['discarded']
+                }
             }
         }
         if(notId !== undefined) {
@@ -956,42 +979,37 @@ group by componentId,compacted;`);
 }
 
 export const getTemporallyCloseDateCompareOp = (play: PlayObject, opts: {bufferTime?: number, useCompleted?: boolean, useDuration?: boolean} = {}): CompareDateOp => {
+    const [sotPlayDate, SOT] = getScrobbleTsSOCDateWithContext(play);
+    const {playDate} = play.data;
+    const isBacklogOrHistory = (play.meta.parsedFrom !== undefined && ([PARSED_FROM.backlog, PARSED_FROM.history] as PARSED_FROM_TYPE[]).includes(play.meta.parsedFrom))
+        || SOT === SCROBBLE_TS_SOC_END;
+
     const {
-        // use either provided arg or default to using source granularity
-        bufferTime = getTemporalAccuracyCloseVal(play.meta.source as SourceType),
+        bufferTime = isBacklogOrHistory ? Math.max(30, getTemporalAccuracyCloseVal(play.meta.source as SourceType)) : 30,
         useCompleted,
         useDuration,
     } = opts;
-        // we get all plays with a play date between playdate - (buffer) AND (playDateCompleted or playDate) + (buffer)
-        let startRange: Dayjs,
+
+    let startRange: Dayjs,
         endRange: Dayjs;
 
-        // make sure we use the 
-        const [sotPlayDate, SOT] = getScrobbleTsSOCDateWithContext(play);
-        const {playDate} = play.data;
-
-        // if play has no playDate fallback to using SOT date (which defaults to now)
-        if(useDuration && play.data.duration !== undefined && playDate !== undefined) {
-            if(SOT === SCROBBLE_TS_SOC_END) {
-                endRange = playDate.add(bufferTime, 's');
-                startRange = playDate.subtract(play.data.duration + bufferTime,'s')
-            } else {
-                endRange = playDate.add(play.data.duration + bufferTime, 's');
-                startRange = playDate.subtract(bufferTime,'s')
-            }
-        } else if(play.data.playDateCompleted !== undefined && useCompleted && playDate !== undefined) {
-            startRange = playDate.subtract(bufferTime, 's');
-            // this will be present if source reports it
-            // or we tracked it live with MemorySource
-            endRange = play.data.playDateCompleted.add(bufferTime, 's');
-        } else {
-            startRange = sotPlayDate.subtract(bufferTime, 's');
-            endRange = sotPlayDate.add(bufferTime, 's');
-        }
-        return {
-            type: 'between',
-            range: [startRange, endRange]
-        }
+    if (isBacklogOrHistory && useDuration && playDate !== undefined) {
+        const dur = play.data.duration ?? 300;
+        startRange = sotPlayDate.subtract(dur + 300 + bufferTime, 's');
+        endRange = sotPlayDate.add(bufferTime, 's');
+    } else if (play.data.playDateCompleted !== undefined && useCompleted && playDate !== undefined) {
+        startRange = playDate.subtract(bufferTime, 's');
+        endRange = play.data.playDateCompleted.add(bufferTime, 's');
+    } else {
+        // Strictly [playedAt - 30s, playedAt + 30s] for live plays without subtracting/adding duration
+        const anchor = playDate ?? sotPlayDate;
+        startRange = anchor.subtract(bufferTime, 's');
+        endRange = anchor.add(bufferTime, 's');
+    }
+    return {
+        type: 'between',
+        range: [startRange, endRange]
+    };
 }
 
 export const buildPlayWith = (args: WithPlayRelation[] | undefined): FindWith<'plays'> | undefined => {
